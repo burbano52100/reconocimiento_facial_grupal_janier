@@ -1,0 +1,333 @@
+"""Reglas de seguridad para dar acceso.
+
+Cada intento de acceso empieza igual:
+  1. identidad  -> los modelos reconocen a la misma persona con >= 90 % durante 1 segundo
+                   y coincide con su perfil registrado. Si no: "otros" (desconocido).
+Despues, segun el modo:
+  Rostro: 2. centrar     -> sin hacer nada, se guarda la posicion de la cara mirando de frente
+                            como referencia (medio segundo).
+          3. movimiento  -> la app pide NUM_MOVIMIENTOS movimientos cortos de la cabeza al azar
+                            (arriba, abajo, izquierda o derecha).
+  Pose:   2. gesto       -> hace un gesto de brazos pedido al azar.
+          3. cabeza      -> gira la cabeza al lado pedido al azar.
+Si falla MAX_INTENTOS veces, la app se bloquea SEGUNDOS_BLOQUEO segundos.
+"""
+import os
+import random
+
+import cv2
+import numpy as np
+
+# ---------------- Ajustes ----------------
+UMBRAL_CONFIANZA = 0.90     # probabilidad minima de los modelos de Teachable Machine
+SEGUNDOS_CONSTANCIA = 1.0   # tiempo que debe mantenerse el mismo resultado
+UMBRAL_ROSTRO = 0.40        # parecido minimo con el perfil de rostro registrado (0 a 1)
+UMBRAL_POSE = 0.85          # parecido minimo con el perfil de pose registrado (0 a 1)
+UMBRAL_GIRO = 0.15          # cuanto hay que girar la cabeza a izquierda / derecha (unos 20 grados)
+UMBRAL_VERTICAL = 0.07      # cuanto hay que mover la cabeza arriba / abajo (unos 12 grados)
+NUM_MOVIMIENTOS = 2         # movimientos de la cabeza que se piden en el reconocimiento facial
+SEGUNDOS_GESTO = 0.6        # tiempo que hay que mantener cada gesto
+TIEMPO_IDENTIDAD = 10       # segundos para confirmar la identidad
+TIEMPO_RETO = 8             # segundos para cada reto
+MAX_INTENTOS = 3
+SEGUNDOS_BLOQUEO = 5
+
+# Clases que no son una persona concreta ("falso" = foto o pantalla, si se entrena esa clase)
+NO_PERSONAS = {"otros", "nada", "fondo", "falso"}
+GESTOS = ["mano derecha arriba", "mano izquierda arriba", "ambas manos arriba",
+          "brazo derecho en cruz", "brazo izquierdo en cruz", "brazos en cruz"]
+NEUTRO = "brazos abajo"
+MOVIMIENTOS = {"arriba": "Levanta un poco la cabeza (ARRIBA)",
+               "abajo": "Baja un poco la cabeza (ABAJO)",
+               "izquierda": "Gira un poco la cabeza a la IZQUIERDA",
+               "derecha": "Gira un poco la cabeza a la DERECHA"}
+
+VERDE, ROJO, AZUL, NEGRO = "#2e7d32", "#c62828", "#1565c0", "black"
+
+
+# ---------------- Patrones del cuerpo y la cara ----------------
+
+def detectar_gesto(puntos, confianzas, minimo=0.3):
+    """Gesto de los brazos a partir de los puntos de PoseNet.
+
+    La imagen esta en espejo, asi que la derecha de la pantalla es la derecha de la persona.
+    Devuelve un nombre de GESTOS, NEUTRO, "otro" o None si no se ven los hombros.
+    """
+    if confianzas[5] < 0.4 or confianzas[6] < 0.4:
+        return None
+    centro_x, altura_hombros = puntos[[5, 6]].mean(axis=0)
+    ancho = max(abs(puntos[5, 0] - puntos[6, 0]), 1)
+    altura_cabeza = puntos[0, 1] if confianzas[0] >= 0.4 else altura_hombros - 0.8 * ancho
+
+    brazos = {"derecho": "abajo", "izquierdo": "abajo"}  # una muneca que no se ve cuenta como abajo
+    for i in (9, 10):  # munecas
+        if confianzas[i] < minimo:
+            continue
+        x, y = puntos[i]
+        lado = "derecho" if x > centro_x else "izquierdo"
+        if y < altura_cabeza:
+            brazos[lado] = "arriba"
+        elif abs(y - altura_hombros) < 0.6 * ancho and abs(x - centro_x) > 1.1 * ancho:
+            brazos[lado] = "cruz"
+
+    derecho, izquierdo = brazos["derecho"], brazos["izquierdo"]
+    if derecho == izquierdo:
+        return {"abajo": NEUTRO, "arriba": "ambas manos arriba", "cruz": "brazos en cruz"}[derecho]
+    if izquierdo == "abajo":
+        return {"arriba": "mano derecha arriba", "cruz": "brazo derecho en cruz"}[derecho]
+    if derecho == "abajo":
+        return {"arriba": "mano izquierda arriba", "cruz": "brazo izquierdo en cruz"}[izquierdo]
+    return "otro"
+
+
+def orientacion_cara(cara):
+    """(horizontal, vertical) de la cara segun donde esta la nariz respecto a los ojos y la boca.
+
+    horizontal: 0 de frente, > 0 girada a la derecha, < 0 a la izquierda (imagen en espejo).
+    vertical:   posicion de la nariz entre los ojos (0) y la boca (1); baja al mirar arriba
+                y sube al mirar abajo. Se mide en el eje de los ojos, por si la cabeza esta inclinada.
+    """
+    ojo_a, ojo_b, nariz, boca_a, boca_b = cara[4:14].reshape(5, 2)
+    izquierdo, derecho = sorted([ojo_a, ojo_b], key=lambda p: p[0])
+    ojos = (izquierdo + derecho) / 2
+    distancia_ojos = max(np.linalg.norm(derecho - izquierdo), 1)
+    eje_x = (derecho - izquierdo) / distancia_ojos
+    eje_y = np.array([-eje_x[1], eje_x[0]])  # perpendicular, hacia abajo
+    boca = (boca_a + boca_b) / 2 - ojos
+    return (float((nariz - ojos) @ eje_x / distancia_ojos),
+            float((nariz - ojos) @ eje_y / max(boca @ eje_y, 1)))
+
+
+def mira_de_frente(orientacion):
+    return orientacion is not None and abs(orientacion[0]) < UMBRAL_GIRO
+
+
+def desplazamiento_cara(horizontal, vertical):
+    """Movimiento de la cara dividido por su umbral: 1 = llega a la meta."""
+    return horizontal / UMBRAL_GIRO, vertical / UMBRAL_VERTICAL
+
+
+def direccion_cara(horizontal, vertical):
+    """'arriba', 'abajo', 'izquierda', 'derecha' o 'centro' (respecto a la posicion de referencia)."""
+    dh, dv = desplazamiento_cara(horizontal, vertical)
+    if max(abs(dh), abs(dv)) < 1:
+        return "centro"
+    if abs(dh) >= abs(dv):
+        return "derecha" if dh > 0 else "izquierda"
+    return "abajo" if dv > 0 else "arriba"
+
+
+# ---------------- Perfiles registrados ----------------
+
+class Perfiles:
+    """Guarda en disco: perfiles/<nombre>/{rostro.npy, pose.npy, fotos_rostro/, fotos_pose/}."""
+
+    def __init__(self, carpeta):
+        self.carpeta = carpeta
+        self._cache = {}
+
+    def huellas(self, nombre, tipo):
+        if (nombre, tipo) not in self._cache:
+            ruta = os.path.join(self.carpeta, nombre, f"{tipo}.npy")
+            self._cache[nombre, tipo] = np.load(ruta) if os.path.exists(ruta) else None
+        return self._cache[nombre, tipo]
+
+    def similitud(self, nombre, tipo, huella):
+        """Parecido (0 a 1) con el perfil: promedio de las 3 fotos registradas mas parecidas."""
+        huellas = self.huellas(nombre, tipo)
+        if huellas is None:
+            return None
+        return float(np.sort(huellas @ huella)[-3:].mean())
+
+    def agregar(self, nombre, tipo, huellas, fotos):
+        """Suma las fotos nuevas al perfil (cada registro lo mejora). Devuelve el total de fotos."""
+        carpeta = os.path.join(self.carpeta, nombre)
+        carpeta_fotos = os.path.join(carpeta, f"fotos_{tipo}")
+        os.makedirs(carpeta_fotos, exist_ok=True)
+        anteriores = self.huellas(nombre, tipo)
+        nuevas = np.array(huellas, np.float32)
+        todas = nuevas if anteriores is None else np.concatenate([anteriores, nuevas])
+        np.save(os.path.join(carpeta, f"{tipo}.npy"), todas)
+        for i, foto in enumerate(fotos, len(todas) - len(nuevas) + 1):
+            cv2.imencode(".jpg", foto)[1].tofile(os.path.join(carpeta_fotos, f"{i:03d}.jpg"))
+        self._cache[nombre, tipo] = todas
+        return len(todas)
+
+
+def decidir_identidad(resultados, perfiles, tipo, calcular_huella, umbral):
+    """Decide quien es la persona.
+
+    resultados: lista de (nombre, probabilidad), uno por cada analisis (cara, foto completa...).
+    Devuelve (dato, motivo): dato es el nombre de la persona, "otros" o "falso".
+    """
+    nombres = {nombre for nombre, _ in resultados}
+    if "falso" in nombres:
+        return "falso", "El modelo detecta una foto o una pantalla."
+    if len(nombres) > 1:
+        return "otros", "Los análisis no coinciden."
+    nombre = nombres.pop()
+    if nombre in NO_PERSONAS:
+        return "otros", f"Clase «{nombre}»."
+    if min(p for _, p in resultados) < UMBRAL_CONFIANZA:
+        return "otros", f"Confianza menor al {UMBRAL_CONFIANZA:.0%}."
+    similitud = perfiles.similitud(nombre, tipo, calcular_huella())
+    if similitud is None:
+        return "otros", f"{nombre} no tiene perfil de {tipo} registrado (usa «Registrar {tipo}»)."
+    if similitud < umbral:
+        return "otros", f"No coincide con el perfil de {nombre} (parecido {similitud:.2f}, mínimo {umbral})."
+    return nombre, f"Coincide con el perfil de {nombre} (parecido {similitud:.2f})."
+
+
+# ---------------- Fases de un intento de acceso ----------------
+
+class Verificador:
+    def __init__(self, perfiles):
+        self.perfiles = perfiles
+        self.fallos = 0
+        self.bloqueado_hasta = 0
+        self.ultimo_acceso = (None, 0)  # (perfil, hasta cuando se muestra el mensaje de acceso)
+        self.modo = "imagen"
+        self.reiniciar()
+
+    def iniciar(self, modo):
+        """Empieza a verificar con el modo 'imagen' (rostro) o 'pose'."""
+        self.modo = modo
+        self.reiniciar()
+
+    def reiniciar(self):
+        """Empieza un intento nuevo (los fallos acumulados se mantienen)."""
+        self.fase = "identidad"
+        self.persona = None
+        self.reto = None
+        self.inicio = None        # cuando empezo el intento
+        self.limite = 0           # hasta cuando hay tiempo en la fase actual
+        self.pausa_hasta = 0      # tiempo mostrando el resultado del intento
+        self.candidato = None     # (valor, desde) para medir la constancia
+        self.movimientos = []     # movimientos de la cabeza pedidos, al azar
+        self.muestras = []        # ultimas posiciones de la cara mirando de frente
+        self.referencia = None    # posicion de la cara mirando de frente (horizontal, vertical)
+        self.titulo, self.color = "Ponte frente a la cámara", NEGRO
+
+    @property
+    def necesita(self):
+        """Que dato necesita la fase actual: 'identidad', 'gesto' u 'orientacion' (de la cara)."""
+        if self.fase == "gesto":
+            return "gesto"
+        if self.fase in ("cabeza", "centrar", "movimiento"):
+            return "orientacion"
+        return "identidad"
+
+    def desplazamiento(self, orientacion):
+        """Movimiento de la cara respecto a la referencia (1 = llega a la meta)."""
+        return desplazamiento_cara(*(np.array(orientacion) - self.referencia))
+
+    def _constante(self, valor, ahora, segundos):
+        """True si 'valor' se ha mantenido igual durante 'segundos'."""
+        if self.candidato is None or self.candidato[0] != valor:
+            self.candidato = (valor, ahora)
+        return ahora - self.candidato[1] >= segundos
+
+    def _cambiar_fase(self, fase, ahora, segundos, reto=None):
+        self.fase, self.reto, self.limite, self.candidato = fase, reto, ahora + segundos, None
+
+    def _fallar(self, ahora, motivo):
+        self.fallos += 1
+        self.titulo, self.color = f"Intento fallido ({self.fallos}/{MAX_INTENTOS}): {motivo}", ROJO
+        self.fase, self.pausa_hasta = "resultado", ahora + 2.5
+        if self.fallos >= MAX_INTENTOS:
+            self.fallos = 0
+            self.bloqueado_hasta = self.pausa_hasta = ahora + SEGUNDOS_BLOQUEO
+            self.titulo = "Límite de intentos fallidos"
+
+    def _conceder(self, ahora):
+        self.fallos = 0
+        self.titulo, self.color = f"ACCESO CONCEDIDO: {self.persona}", VERDE
+        self.fase, self.pausa_hasta = "resultado", ahora + 4
+        self.ultimo_acceso = (self.persona, self.pausa_hasta)
+
+    def paso(self, ahora, dato, confianza=None):
+        """Avanza con el dato del cuadro actual de la camara:
+        identidad   -> nombre de la persona, "otros", "falso" o None (nadie delante);
+                       confianza es el porcentaje mas bajo de los analisis
+        gesto       -> nombre del gesto o None
+        orientacion -> (horizontal, vertical) de orientacion_cara() o None
+        """
+        if self.fase == "resultado":
+            if ahora < self.pausa_hasta:
+                return
+            self.reiniciar()
+
+        restante = max(self.limite - ahora, 0)
+        if self.fase == "identidad":
+            self._paso_identidad(ahora, dato, confianza)
+
+        elif self.fase == "gesto":
+            self.titulo, self.color = f"Reto: {self.reto} ({restante:.0f} s)", AZUL
+            if self._constante(dato, ahora, SEGUNDOS_GESTO) and dato == self.reto:
+                self._cambiar_fase("cabeza", ahora, TIEMPO_RETO, random.choice(["izquierda", "derecha"]))
+            elif restante <= 0:
+                self._fallar(ahora, "no hiciste el gesto pedido.")
+
+        elif self.fase == "cabeza":
+            self.titulo, self.color = f"Reto: gira la cabeza a la {self.reto} ({restante:.0f} s)", AZUL
+            lado = None if dato is None else (
+                "derecha" if dato[0] > UMBRAL_GIRO else "izquierda" if dato[0] < -UMBRAL_GIRO else "centro")
+            if self._constante(lado, ahora, 0.3) and lado == self.reto:
+                self._conceder(ahora)
+            elif restante <= 0:
+                self._fallar(ahora, "no giraste la cabeza.")
+
+        elif self.fase == "centrar":
+            self.titulo, self.color = f"Rostro reconocido: {self.persona}\nMira de frente un momento...", VERDE
+            de_frente = mira_de_frente(dato)
+            if de_frente:
+                self.muestras = (self.muestras + [dato])[-5:]
+            if self._constante(de_frente, ahora, 0.5) and de_frente:
+                self.referencia = np.median(self.muestras, axis=0)
+                self._cambiar_fase("movimiento", ahora, TIEMPO_RETO, self.movimientos[0])
+            elif restante <= 0:
+                self.reiniciar()  # no miro de frente: se vuelve a empezar sin contar un fallo
+
+        elif self.fase == "movimiento":
+            numero = NUM_MOVIMIENTOS - len(self.movimientos) + 1
+            self.titulo, self.color = (f"{numero}/{NUM_MOVIMIENTOS}: {MOVIMIENTOS[self.reto]} "
+                                       f"({restante:.0f} s)"), AZUL
+            direccion = None if dato is None else direccion_cara(*(np.array(dato) - self.referencia))
+            if self._constante(direccion, ahora, 0.3) and direccion == self.reto:
+                self.movimientos.pop(0)
+                if self.movimientos:
+                    self._cambiar_fase("movimiento", ahora, TIEMPO_RETO, self.movimientos[0])
+                else:
+                    self._conceder(ahora)
+            elif restante <= 0:
+                self._fallar(ahora, f"no moviste la cabeza hacia {self.reto}.")
+
+    def _paso_identidad(self, ahora, dato, confianza):
+        if dato is None:  # nadie delante: no cuenta como intento
+            self.inicio, self.candidato = None, None
+            self.titulo, self.color = "Ponte frente a la cámara", NEGRO
+            return
+        if self.inicio is None:
+            self.inicio = ahora
+        estable = self._constante(dato, ahora, SEGUNDOS_CONSTANCIA)
+
+        if dato == "falso":
+            self.titulo, self.color = "¡Posible foto o pantalla!", ROJO
+            if estable:
+                return self._fallar(ahora, "se detectó una foto o pantalla.")
+        elif dato == "otros":
+            self.titulo, self.color = "Desconocido (otros)", ROJO
+        elif estable:
+            self.persona = dato
+            if self.modo == "imagen":
+                self.movimientos = random.sample(list(MOVIMIENTOS), NUM_MOVIMIENTOS)
+                return self._cambiar_fase("centrar", ahora, TIEMPO_RETO)
+            return self._cambiar_fase("gesto", ahora, TIEMPO_RETO, random.choice(GESTOS))
+        else:  # cuenta el tiempo seguido sin bajar del porcentaje minimo (si baja, vuelve a 0)
+            segundos = ahora - self.candidato[1]
+            porcentaje = f" {confianza:.0%} (mínimo {UMBRAL_CONFIANZA:.0%})" if confianza is not None else ""
+            self.titulo, self.color = (f"{dato}{porcentaje}\n"
+                                       f"Manteniendo: {segundos:.1f} / {SEGUNDOS_CONSTANCIA:g} s"), AZUL
+
+        if ahora - self.inicio > TIEMPO_IDENTIDAD:
+            self._fallar(ahora, "no se pudo confirmar la identidad.")
