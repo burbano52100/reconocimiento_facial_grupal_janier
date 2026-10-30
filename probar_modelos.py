@@ -5,9 +5,9 @@ Uso:
   python probar_modelos.py grabar <persona> [segundos]   graba la voz              -> muestras/<persona>/
   python probar_modelos.py [carpeta]                     prueba los tres modelos con todas las muestras
 
-En muestras/ va una carpeta por persona (burbano, kevin, julian, salgado...). La carpeta "desconocidos"
+En muestras/ va una carpeta por persona (burbano, julian, kevin...). La carpeta "desconocidos"
 es para personas que NO deben entrar; si no existe, se usan las fotos de "otros" que trae modelos.zip.
-Al grabar, di tu palabra secreta varias veces con una pausa despues de cada una: cada frase cuenta
+Al grabar, di tu palabra clave varias veces con una pausa despues de cada una: cada frase cuenta
 como un intento de entrar. Se analiza todo con las mismas funciones y reglas de la app.
 """
 import collections
@@ -25,7 +25,7 @@ import numpy as np
 import app
 from microfono import Microfono
 from modelos import DetectorFrase, Escucha, recorte_cara, recorte_cuadrado
-from seguridad import NIVEL_MINIMO_VOZ, NO_PERSONAS, UMBRAL_CONFIANZA, decidir_palabra
+from seguridad import NIVEL_MINIMO_VOZ, NO_PERSONAS, UMBRAL_CONFIANZA
 
 MUESTRAS = os.path.join(app.CARPETA, "muestras")
 DESCONOCIDOS = "desconocidos"
@@ -65,7 +65,7 @@ def tomar_fotos(persona, cantidad=20):
 def grabar(persona, segundos=10):
     carpeta = _carpeta(persona)
     microfono = Microfono()
-    print(f"Grabando {segundos} s: {persona}, di tu palabra secreta varias veces, con una pausa después de cada una...")
+    print(f"Grabando {segundos} s: {persona}, di tu palabra clave varias veces, con una pausa después de cada una...")
     partes, total = [], 0
     while total < segundos * 44100:
         partes.append(microfono.leer())
@@ -132,8 +132,8 @@ def analizar_foto(a, bgr):
 
 
 def analizar_audio(a, audio):
-    """Recorta cada frase de la grabacion (como la app) y devuelve [(voz que reconoce el modelo,
-    perfil que entraria con voz + palabra secreta)], uno por frase."""
+    """Recorta cada frase de la grabacion (como la app) y devuelve el perfil que entraria con cada
+    frase (el que reconoce el modelo de voz con >= 90 %) o None."""
     voz, salto = a.modelo_voz, a.modelo_voz.SALTO
     escucha, detector = Escucha(voz, app.ESPECTROS_POR_PREDICCION), DetectorFrase(NIVEL_MINIMO_VOZ)
     analisis, frases = collections.deque(maxlen=60), []
@@ -143,8 +143,7 @@ def analizar_audio(a, audio):
             analisis.append((escucha.llenos, voz.predecir(escucha.espectros)))
         frase = detector.actualizar(escucha)
         if frase is not None and analisis:
-            persona, _, huella = a._voz_y_palabra(frase, analisis)
-            frases.append((persona, decidir_palabra(persona, a.perfiles, huella)[0]))
+            frases.append(a._voz_de_frase(frase, analisis)[0])
     return frases
 
 
@@ -211,14 +210,10 @@ def evaluar(carpeta):
             print(f"\nAnalizando {len(audios)} grabaciones de {persona}...")
             frases[persona] = [f for audio in audios for f in analizar_audio(a, audio)]
     if frases:
-        con_palabra = [n for n in a.personas["voz"] if a.perfiles.palabra(n)]
-        print(f"\nPalabra secreta registrada: {', '.join(con_palabra) or 'nadie'}")
-        for indice, analisis in [(0, "VOZ: SOLO EL MODELO"), (1, "VOZ: APP COMPLETA (voz + palabra secreta)")]:
-            print(f"\n=== {analisis}  (personas del modelo: {', '.join(a.personas['voz'])}) ===")
-            todos = {p: [f[indice] for f in fs] for p, fs in frases.items()}
-            for persona, resultados in todos.items():
-                print(f"  {persona:13s} {len(resultados):4d} frases  {resumen(persona, resultados, a.personas['voz'])}")
-            print("  Fiabilidad: " + fiabilidad(todos, a.personas["voz"]))
+        print(f"\n=== VOZ  (personas del modelo: {', '.join(a.personas['voz'])}) ===")
+        for persona, resultados in frases.items():
+            print(f"  {persona:13s} {len(resultados):4d} frases  {resumen(persona, resultados, a.personas['voz'])}")
+        print("  Fiabilidad: " + fiabilidad(frases, a.personas["voz"]))
     else:
         print("\n(No hay grabaciones de voz: usa  python probar_modelos.py grabar <persona>)")
     raiz.destroy()

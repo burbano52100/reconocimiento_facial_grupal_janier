@@ -4,6 +4,9 @@ Cada intento de acceso empieza igual:
   1. identidad  -> los modelos reconocen a la misma persona con >= 90 % durante 1 segundo
                    y coincide con su perfil registrado, y ese perfil es el que mas se parece de
                    todos los registrados. Si no: "otros" (desconocido).
+                   La clase "otros" tiene su propio perfil de rostro (perfiles/otros, fotos de
+                   personas que no estan en los perfiles, ver crear_perfil_otros.py): si la cara se
+                   parece mas a "otros" que al perfil de la persona, es un desconocido.
                    Pose: ademas la cara debe coincidir con el perfil de rostro de esa persona
                    (probado con 610 fotos de desconocidos: el modelo de pose solo dice "burbano"
                    al 90 % en el 79 % de ellas).
@@ -14,24 +17,17 @@ Despues, segun el modo:
                             (arriba, abajo, izquierda o derecha).
   Pose:   2. gesto       -> hace un gesto de brazos pedido al azar.
           3. cabeza      -> gira la cabeza al lado pedido al azar.
-La voz funciona distinto: la persona dice su palabra secreta (una frase entre dos silencios) y entra
-si se cumplen las dos cosas a la vez:
-  - el modelo de voz reconoce a la persona con >= 90 % al menos VECES_VOZ veces durante la frase
-    (y a nadie mas), y el volumen supera NIVEL_MINIMO_VOZ;
-  - la frase se parece a la palabra secreta registrada de esa persona (distancia <= UMBRAL_PALABRA)
-    mas que a la de cualquier otro perfil.
-  El modelo de Teachable Machine solo distingue personas, no palabras: la palabra se compara con las
-  grabaciones del registro (MFCC + DTW). Se guarda solo esa huella, nunca el audio ni el texto.
+La voz funciona distinto: la persona dice su palabra clave (una frase entre dos silencios, la misma
+con la que se entreno su clase en Teachable Machine) y entra al perfil de esa clase si el modelo de
+voz la reconoce con >= 90 % al menos VECES_VOZ veces durante la frase (y a nadie mas), con un volumen
+mayor que NIVEL_MINIMO_VOZ. No hace falta registrar nada: las clases del modelo son los perfiles.
 Si falla MAX_INTENTOS veces, la app se bloquea SEGUNDOS_BLOQUEO segundos.
 """
-import itertools
 import os
 import random
 
 import cv2
 import numpy as np
-
-from modelos import distancia_frases
 
 # ---------------- Ajustes ----------------
 UMBRAL_CONFIANZA = 0.90     # probabilidad minima de los modelos de Teachable Machine
@@ -44,17 +40,15 @@ NUM_MOVIMIENTOS = 2         # movimientos de la cabeza que se piden en el recono
 SEGUNDOS_GESTO = 0.6        # tiempo que hay que mantener cada gesto
 NIVEL_MINIMO_VOZ = -55      # volumen minimo (dBFS) para analizar la voz: menos es silencio o microfono apagado
 VECES_VOZ = 2               # analisis del modelo de voz que deben reconocer a la persona durante la frase
-UMBRAL_PALABRA = 2.5        # diferencia maxima con la palabra secreta registrada (misma frase: ~0,6-1;
-                            # otra frase: 3,6 o mas, medido con 90 grabaciones)
-REPETICIONES_PALABRA = 3    # veces que se graba la palabra secreta al registrarla
 TIEMPO_IDENTIDAD = 10       # segundos para confirmar la identidad
 TIEMPO_RETO = 8             # segundos para cada reto
 MAX_INTENTOS = 3
 SEGUNDOS_BLOQUEO = 5
 
 RUIDO = "Ruido de fondo"    # clase del modelo de voz que significa que nadie habla
+OTROS = "otros"             # personas que no estan en los perfiles (desconocidos)
 # Clases que no son una persona concreta ("falso" = foto o pantalla, si se entrena esa clase)
-NO_PERSONAS = {"otros", "nada", "fondo", "falso", RUIDO, "palabra al azar"}
+NO_PERSONAS = {OTROS, "nada", "fondo", "falso", RUIDO, "palabra al azar"}
 GESTOS = ["mano derecha arriba", "mano izquierda arriba", "ambas manos arriba",
           "brazo derecho en cruz", "brazo izquierdo en cruz", "brazos en cruz"]
 NEUTRO = "brazos abajo"
@@ -141,7 +135,7 @@ def direccion_cara(horizontal, vertical):
 # ---------------- Perfiles registrados ----------------
 
 class Perfiles:
-    """Guarda en disco: perfiles/<nombre>/{rostro.npy, pose.npy, fotos_rostro/, fotos_pose/, palabra.npz}."""
+    """Guarda en disco: perfiles/<nombre>/{rostro.npy, pose.npy, fotos_rostro/, fotos_pose/}."""
 
     def __init__(self, carpeta):
         self.carpeta = carpeta
@@ -190,46 +184,22 @@ class Perfiles:
         self._cache[nombre, tipo] = todas
         return len(todas)
 
-    def palabra(self, nombre):
-        """Huellas (MFCC) de las grabaciones de la palabra secreta, o None si no tiene."""
-        if (nombre, "palabra") not in self._cache:
-            ruta = os.path.join(self.carpeta, nombre, "palabra.npz")
-            if os.path.exists(ruta):
-                with np.load(ruta) as datos:
-                    self._cache[nombre, "palabra"] = [datos[k] for k in sorted(datos.files)]
-            else:
-                self._cache[nombre, "palabra"] = None
-        return self._cache[nombre, "palabra"]
-
-    def guardar_palabra(self, nombre, frases):
-        """Reemplaza la palabra secreta (solo sus huellas: ni audio ni texto)."""
-        os.makedirs(os.path.join(self.carpeta, nombre), exist_ok=True)
-        np.savez(os.path.join(self.carpeta, nombre, "palabra.npz"), *frases)
-        self._cache[nombre, "palabra"] = list(frases)
-
-    def distancia_palabra(self, nombre, frase):
-        """Diferencia entre la frase dicha y la palabra secreta (la grabacion mas parecida), o None."""
-        grabaciones = self.palabra(nombre)
-        return None if grabaciones is None else min(distancia_frases(frase, g) for g in grabaciones)
-
-    def palabra_mas_parecida(self, frase):
-        """(nombre, distancia) del perfil cuya palabra secreta mas se parece a la frase."""
-        nombres = os.listdir(self.carpeta) if os.path.isdir(self.carpeta) else []
-        distancias = [(self.distancia_palabra(n, frase), n) for n in nombres]
-        return min(((d, n) for d, n in distancias if d is not None), default=(None, None))[::-1]
-
-
-def coherencia_palabra(frases):
-    """Diferencia maxima entre las grabaciones del registro (deben parecerse entre si)."""
-    return max(distancia_frases(a, b) for a, b in itertools.combinations(frases, 2))
-
 
 def voz_de_frase(resultados):
-    """Persona que reconoce el modelo de voz mientras se dice una frase.
+    """Modo voz: perfil (clase del modelo de voz) que entra con la frase recien dicha.
 
     resultados: (nombre, probabilidad) de cada analisis del modelo durante la frase.
-    Devuelve (persona o None, motivo).
+    Devuelve (persona o None, motivo, cuenta_como_fallo). Si durante la frase el modelo solo oyo
+    ruido de fondo no cuenta como intento fallido.
     """
+    persona, motivo = _persona_de_voz(resultados)
+    if persona is not None:
+        return persona, motivo, False
+    return None, motivo, any(n not in NO_PERSONAS for n, _ in resultados)
+
+
+def _persona_de_voz(resultados):
+    """(persona que reconoce el modelo de voz con >= UMBRAL_CONFIANZA o None, motivo)."""
     seguras = [n for n, p in resultados if p >= UMBRAL_CONFIANZA and n not in NO_PERSONAS]
     if len(set(seguras)) > 1:
         return None, "El modelo oye la voz de varias personas: " + ", ".join(sorted(set(seguras))) + "."
@@ -241,31 +211,6 @@ def voz_de_frase(resultados):
         mejor = f" (lo más alto: {max(personas)[1]} {max(personas)[0]:.0%})" if personas else ""
         return None, f"El modelo de voz no te reconoce con {UMBRAL_CONFIANZA:.0%}{mejor}."
     return seguras[0], f"{seguras[0]}, reconocido {len(seguras)} veces con {UMBRAL_CONFIANZA:.0%} o más."
-
-
-def decidir_palabra(persona, perfiles, frase):
-    """Modo voz: la persona que reconoce el modelo debe haber dicho SU palabra secreta.
-
-    persona: resultado de voz_de_frase (o None). frase: huella de lo que se dijo.
-    Devuelve (persona o None, motivo, cuenta_como_fallo). Si ni la voz ni la palabra son de
-    nadie (otra gente hablando, ruido) no cuenta como intento fallido.
-    """
-    duena, distancia = perfiles.palabra_mas_parecida(frase)
-    if duena is None:
-        return None, "Nadie tiene palabra secreta: usa «Registrar palabra».", False
-    palabra_valida = distancia <= UMBRAL_PALABRA
-    if persona is None:
-        if palabra_valida:
-            return None, f"Es la palabra de {duena}, pero el modelo no reconoce su voz.", True
-        return None, "No reconozco ni la voz ni la palabra.", False
-    propia = perfiles.distancia_palabra(persona, frase)
-    if propia is None:
-        return None, f"{persona} no tiene palabra secreta (usa «Registrar palabra»).", False
-    if propia > UMBRAL_PALABRA:
-        return None, f"No es la palabra secreta de {persona} (diferencia {propia:.2f}, máximo {UMBRAL_PALABRA}).", True
-    if duena != persona:
-        return None, f"La frase se parece más a la palabra de {duena} que a la de {persona}.", True
-    return persona, f"Palabra secreta de {persona} correcta (diferencia {propia:.2f}).", False
 
 
 def decidir_identidad(resultados, perfiles, tipo, calcular_huella, umbral):
@@ -291,6 +236,9 @@ def decidir_identidad(resultados, perfiles, tipo, calcular_huella, umbral):
     if similitud < umbral:
         return "otros", f"No coincide con el perfil de {nombre} (parecido {similitud:.2f}, mínimo {umbral})."
     otro, parecido = perfiles.mas_parecido(tipo, huella)
+    if otro == OTROS:
+        return "otros", (f"Se parece más a la clase «{OTROS}» (personas sin perfil, {parecido:.2f}) "
+                         f"que al perfil de {nombre} ({similitud:.2f}).")
     if otro != nombre:
         return "otros", f"Se parece más al perfil de {otro} ({parecido:.2f}) que al de {nombre} ({similitud:.2f})."
     return nombre, f"Coincide con el perfil de {nombre} (parecido {similitud:.2f})."
@@ -328,7 +276,7 @@ class Verificador:
 
     def _esperar(self):
         """Titulo mientras no hay nadie delante de la camara (o nadie hablando)."""
-        self.titulo = "Di tu palabra secreta" if self.modo == "voz" else "Ponte frente a la cámara"
+        self.titulo = "Di tu palabra clave" if self.modo == "voz" else "Ponte frente a la cámara"
         self.color = NEGRO
 
     def esperar_frase(self, ahora, hablando):
@@ -343,7 +291,7 @@ class Verificador:
             self._esperar()
 
     def frase(self, ahora, persona, motivo, cuenta_como_fallo):
-        """Modo voz: termino una frase. persona = perfil cuya voz y palabra coinciden, o None."""
+        """Modo voz: termino una frase. persona = perfil que reconoce el modelo de voz, o None."""
         if self.fase == "resultado" and ahora < self.pausa_hasta:
             return
         if persona:

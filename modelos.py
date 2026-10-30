@@ -3,7 +3,7 @@
 - ClasificadorImagen: modelo Keras (.h5) = MobileNetV2 + capas densas.
 - ClasificadorPose:   modelo TF.js de pose = PoseNet (MobileNetV1) + capas densas.
 - ClasificadorVoz:    modelo TF.js de audio = espectrograma + red convolucional (speech-commands).
-- DetectorFrase:      recorta cada frase hablada; huella_frase / distancia_frases comparan palabras.
+- DetectorFrase:      recorta cada frase hablada (voz entre dos silencios).
 - AnalizadorCaras:    detector de caras (YuNet) + huella facial (SFace) de OpenCV.
 """
 import base64
@@ -486,37 +486,6 @@ class DetectorFrase:
                 else:
                     self.aviso = "Sonido demasiado corto."
         return terminada
-
-
-def _banco_mel(n_frecuencias, filtros=26, minimo=100, maximo=4900, frecuencia=44100, n_fft=2048):
-    """Filtros triangulares en escala mel (como el oido): (n_frecuencias, filtros)."""
-    mel = np.linspace(2595 * np.log10(1 + minimo / 700), 2595 * np.log10(1 + maximo / 700), filtros + 2)
-    centros = 700 * (10 ** (mel / 2595) - 1) * n_fft / frecuencia  # en posiciones del espectro
-    k = np.arange(n_frecuencias)[:, None]
-    izquierda, centro, derecha = centros[:-2], centros[1:-1], centros[2:]
-    return np.maximum(0, np.minimum((k - izquierda) / (centro - izquierda), (derecha - k) / (derecha - centro)))
-
-
-def huella_frase(espectros, coeficientes=12):
-    """MFCC de una frase: como suena cada momento, sin depender del volumen ni del microfono."""
-    energia = np.log((10 ** (np.asarray(espectros) / 10)) @ _banco_mel(espectros.shape[1]) + 1e-12)
-    n = energia.shape[1]
-    dct = np.cos(np.pi / n * (np.arange(n) + 0.5)[None, :] * np.arange(1, coeficientes + 1)[:, None])
-    mfcc = energia @ dct.T
-    return (mfcc - mfcc.mean(axis=0)).astype(np.float32)
-
-
-def distancia_frases(a, b):
-    """Diferencia entre dos frases (0 = iguales). DTW: alinea las frases aunque se digan a distinto ritmo."""
-    coste = np.sqrt(((a[:, None, :] - b[None, :, :]) ** 2).mean(axis=2)).tolist()
-    n, m = len(a), len(b)
-    anterior = [0.0] + [float("inf")] * m
-    for i in range(1, n + 1):
-        fila, actual = coste[i - 1], [float("inf")] * (m + 1)
-        for j in range(1, m + 1):
-            actual[j] = fila[j - 1] + min(anterior[j], actual[j - 1], anterior[j - 1])
-        anterior = actual
-    return anterior[m] / (n + m)
 
 
 # ---------------------------------------------------------------------------
