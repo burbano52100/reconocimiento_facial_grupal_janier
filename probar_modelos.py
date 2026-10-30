@@ -5,7 +5,7 @@ Uso:
   python probar_modelos.py grabar <persona> [segundos]   graba la voz              -> muestras/<persona>/
   python probar_modelos.py [carpeta]                     prueba los tres modelos con todas las muestras
 
-En muestras/ va una carpeta por persona (burbano, kevin, julian, salgado...). La carpeta "desconocidos"
+En muestras/ va una carpeta por persona (burbano, kevin, julian...). La carpeta "desconocidos"
 es para personas que NO deben entrar; si no existe, se usan las fotos de "otros" que trae modelos.zip.
 Al grabar, di tu palabra secreta varias veces con una pausa despues de cada una: cada frase cuenta
 como un intento de entrar. Se analiza todo con las mismas funciones y reglas de la app.
@@ -42,9 +42,10 @@ def _carpeta(persona):
 
 def tomar_fotos(persona, cantidad=20):
     carpeta = _carpeta(persona)
-    camara = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-    if not camara.isOpened():
-        sys.exit("No se pudo abrir la cámara.")
+    try:
+        camara, _ = app.abrir_camara()
+    except RuntimeError as e:
+        sys.exit(str(e))
     print(f"Se tomarán {cantidad} fotos de {persona}, una cada medio segundo. Muévete un poco entre fotos.")
     for n in (3, 2, 1):
         print(f"  {n}...")

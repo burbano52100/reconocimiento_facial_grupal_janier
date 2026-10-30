@@ -1,7 +1,7 @@
 """Reglas de seguridad para dar acceso.
 
 Cada intento de acceso empieza igual:
-  1. identidad  -> los modelos reconocen a la misma persona con >= 90 % durante 1 segundo
+  1. identidad  -> los modelos reconocen a la misma persona con >= 85 % (UMBRAL_CONFIANZA) durante 1 segundo
                    y coincide con su perfil registrado, y ese perfil es el que mas se parece de
                    todos los registrados. Si no: "otros" (desconocido).
                    Pose: ademas la cara debe coincidir con el perfil de rostro de esa persona
@@ -16,7 +16,7 @@ Despues, segun el modo:
           3. cabeza      -> gira la cabeza al lado pedido al azar.
 La voz funciona distinto: la persona dice su palabra secreta (una frase entre dos silencios) y entra
 si se cumplen las dos cosas a la vez:
-  - el modelo de voz reconoce a la persona con >= 90 % al menos VECES_VOZ veces durante la frase
+  - el modelo de voz reconoce a la persona con >= 90 % (UMBRAL_VOZ) al menos VECES_VOZ veces durante la frase
     (y a nadie mas), y el volumen supera NIVEL_MINIMO_VOZ;
   - la frase se parece a la palabra secreta registrada de esa persona (distancia <= UMBRAL_PALABRA)
     mas que a la de cualquier otro perfil.
@@ -34,7 +34,8 @@ import numpy as np
 from modelos import distancia_frases
 
 # ---------------- Ajustes ----------------
-UMBRAL_CONFIANZA = 0.90     # probabilidad minima de los modelos de Teachable Machine
+UMBRAL_CONFIANZA = 0.85     # probabilidad minima de los modelos de rostro y pose de Teachable Machine
+UMBRAL_VOZ = 0.90           # probabilidad minima del modelo de voz
 SEGUNDOS_CONSTANCIA = 1.0   # tiempo que debe mantenerse el mismo resultado
 UMBRAL_ROSTRO = 0.40        # parecido minimo con el perfil de rostro registrado (0 a 1)
 UMBRAL_POSE = 0.85          # parecido minimo con el perfil de pose registrado (0 a 1)
@@ -230,17 +231,17 @@ def voz_de_frase(resultados):
     resultados: (nombre, probabilidad) de cada analisis del modelo durante la frase.
     Devuelve (persona o None, motivo).
     """
-    seguras = [n for n, p in resultados if p >= UMBRAL_CONFIANZA and n not in NO_PERSONAS]
+    seguras = [n for n, p in resultados if p >= UMBRAL_VOZ and n not in NO_PERSONAS]
     if len(set(seguras)) > 1:
         return None, "El modelo oye la voz de varias personas: " + ", ".join(sorted(set(seguras))) + "."
     if seguras and len(seguras) < VECES_VOZ:
         return None, (f"El modelo de voz reconoció a {seguras[0]} solo {len(seguras)} vez con "
-                      f"{UMBRAL_CONFIANZA:.0%} (hacen falta {VECES_VOZ}): habla más claro o un poco más largo.")
+                      f"{UMBRAL_VOZ:.0%} (hacen falta {VECES_VOZ}): habla más claro o un poco más largo.")
     if len(seguras) < VECES_VOZ:
         personas = [(p, n) for n, p in resultados if n not in NO_PERSONAS]
         mejor = f" (lo más alto: {max(personas)[1]} {max(personas)[0]:.0%})" if personas else ""
-        return None, f"El modelo de voz no te reconoce con {UMBRAL_CONFIANZA:.0%}{mejor}."
-    return seguras[0], f"{seguras[0]}, reconocido {len(seguras)} veces con {UMBRAL_CONFIANZA:.0%} o más."
+        return None, f"El modelo de voz no te reconoce con {UMBRAL_VOZ:.0%}{mejor}."
+    return seguras[0], f"{seguras[0]}, reconocido {len(seguras)} veces con {UMBRAL_VOZ:.0%} o más."
 
 
 def decidir_palabra(persona, perfiles, frase):

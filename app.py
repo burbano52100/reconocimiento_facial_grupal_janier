@@ -29,6 +29,8 @@ MODOS_VOZ = ("voz", "registrar_palabra")  # modos que usan el microfono en vez d
 VERDE_RGB, ROJO_RGB, AZUL_RGB = (0, 200, 0), (220, 0, 0), (30, 120, 255)
 AMARILLO_RGB, GRIS_RGB, BLANCO_RGB = (255, 200, 0), (170, 170, 170), (255, 255, 255)
 METAS = {"arriba": (0, -1), "abajo": (0, 1), "izquierda": (-1, 0), "derecha": (1, 0)}
+# Orden en que se buscan las camaras: primero las externas (USB) y, si no hay, la del portatil (0)
+CAMARAS = (1, 2, 3, 0)
 
 BOTONES = [  # (modo, texto, fila, columna)
     ("imagen", "Reconocimiento facial", 0, 0),
@@ -38,6 +40,17 @@ BOTONES = [  # (modo, texto, fila, columna)
     ("voz", "Reconocimiento por voz", 2, 0),
     ("registrar_palabra", "Registrar palabra", 2, 1),
 ]
+
+
+def abrir_camara():
+    """Abre la primera camara de CAMARAS que de imagen. Devuelve (camara, indice)."""
+    for indice in CAMARAS:
+        for api in (cv2.CAP_DSHOW, cv2.CAP_ANY):
+            camara = cv2.VideoCapture(indice, api)
+            if camara.isOpened() and camara.read()[0]:
+                return camara, indice
+            camara.release()
+    raise RuntimeError("No se pudo abrir ninguna cámara (ni externa ni la del portátil).")
 
 
 def dibujar_esqueleto(imagen, puntos, confianzas, minimo=0.4):
@@ -222,19 +235,17 @@ class App:
         return self.caras
 
     def _trabajar(self):
-        self.estado = "Abriendo la cámara..."
-        camara = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-        if not camara.isOpened():
-            camara = cv2.VideoCapture(0)
+        self.estado = "Buscando la cámara..."
+        camara = None
         modo_anterior = None
         try:
-            if not camara.isOpened():
-                raise RuntimeError("No se pudo abrir la cámara.")
+            camara, indice = abrir_camara()
+            nombre_camara = "cámara del portátil" if indice == 0 else f"cámara externa ({indice})"
             while self.modo and self.modo not in MODOS_VOZ:  # la voz usa su propio hilo (_escuchar)
                 modo = self.modo
                 if modo != modo_anterior:
                     self.verificador.iniciar(modo)
-                    self.estado = "Pulsa el mismo botón para apagar la cámara."
+                    self.estado = f"Usando la {nombre_camara}. Pulsa el mismo botón para apagarla."
                     modo_anterior = modo
 
                 ok, cuadro = camara.read()
@@ -259,7 +270,8 @@ class App:
         except Exception as e:
             self.error = str(e)
         finally:
-            camara.release()
+            if camara is not None:
+                camara.release()
 
     def _paso_verificacion(self, modo, bgr, rgb, vista, escala, ahora):
         v = self.verificador
