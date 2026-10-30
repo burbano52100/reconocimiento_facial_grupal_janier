@@ -2,7 +2,11 @@
 
 Cada intento de acceso empieza igual:
   1. identidad  -> los modelos reconocen a la misma persona con >= 90 % durante 1 segundo
-                   y coincide con su perfil registrado. Si no: "otros" (desconocido).
+                   y coincide con su perfil registrado, y ese perfil es el que mas se parece de
+                   todos los registrados. Si no: "otros" (desconocido).
+                   Pose: ademas la cara debe coincidir con el perfil de rostro de esa persona
+                   (probado con 610 fotos de desconocidos: el modelo de pose solo dice "burbano"
+                   al 90 % en el 79 % de ellas).
 Despues, segun el modo:
   Rostro: 2. centrar     -> sin hacer nada, se guarda la posicion de la cara mirando de frente
                             como referencia (medio segundo).
@@ -10,13 +14,24 @@ Despues, segun el modo:
                             (arriba, abajo, izquierda o derecha).
   Pose:   2. gesto       -> hace un gesto de brazos pedido al azar.
           3. cabeza      -> gira la cabeza al lado pedido al azar.
+La voz funciona distinto: la persona dice su palabra secreta (una frase entre dos silencios) y entra
+si se cumplen las dos cosas a la vez:
+  - el modelo de voz reconoce a la persona con >= 90 % al menos VECES_VOZ veces durante la frase
+    (y a nadie mas), y el volumen supera NIVEL_MINIMO_VOZ;
+  - la frase se parece a la palabra secreta registrada de esa persona (distancia <= UMBRAL_PALABRA)
+    mas que a la de cualquier otro perfil.
+  El modelo de Teachable Machine solo distingue personas, no palabras: la palabra se compara con las
+  grabaciones del registro (MFCC + DTW). Se guarda solo esa huella, nunca el audio ni el texto.
 Si falla MAX_INTENTOS veces, la app se bloquea SEGUNDOS_BLOQUEO segundos.
 """
+import itertools
 import os
 import random
 
 import cv2
 import numpy as np
+
+from modelos import distancia_frases
 
 # ---------------- Ajustes ----------------
 UMBRAL_CONFIANZA = 0.90     # probabilidad minima de los modelos de Teachable Machine
@@ -27,13 +42,19 @@ UMBRAL_GIRO = 0.15          # cuanto hay que girar la cabeza a izquierda / derec
 UMBRAL_VERTICAL = 0.07      # cuanto hay que mover la cabeza arriba / abajo (unos 12 grados)
 NUM_MOVIMIENTOS = 2         # movimientos de la cabeza que se piden en el reconocimiento facial
 SEGUNDOS_GESTO = 0.6        # tiempo que hay que mantener cada gesto
+NIVEL_MINIMO_VOZ = -55      # volumen minimo (dBFS) para analizar la voz: menos es silencio o microfono apagado
+VECES_VOZ = 2               # analisis del modelo de voz que deben reconocer a la persona durante la frase
+UMBRAL_PALABRA = 2.5        # diferencia maxima con la palabra secreta registrada (misma frase: ~0,6-1;
+                            # otra frase: 3,6 o mas, medido con 90 grabaciones)
+REPETICIONES_PALABRA = 3    # veces que se graba la palabra secreta al registrarla
 TIEMPO_IDENTIDAD = 10       # segundos para confirmar la identidad
 TIEMPO_RETO = 8             # segundos para cada reto
 MAX_INTENTOS = 3
 SEGUNDOS_BLOQUEO = 5
 
+RUIDO = "Ruido de fondo"    # clase del modelo de voz que significa que nadie habla
 # Clases que no son una persona concreta ("falso" = foto o pantalla, si se entrena esa clase)
-NO_PERSONAS = {"otros", "nada", "fondo", "falso"}
+NO_PERSONAS = {"otros", "nada", "fondo", "falso", RUIDO, "palabra al azar"}
 GESTOS = ["mano derecha arriba", "mano izquierda arriba", "ambas manos arriba",
           "brazo derecho en cruz", "brazo izquierdo en cruz", "brazos en cruz"]
 NEUTRO = "brazos abajo"
@@ -120,11 +141,27 @@ def direccion_cara(horizontal, vertical):
 # ---------------- Perfiles registrados ----------------
 
 class Perfiles:
-    """Guarda en disco: perfiles/<nombre>/{rostro.npy, pose.npy, fotos_rostro/, fotos_pose/}."""
+    """Guarda en disco: perfiles/<nombre>/{rostro.npy, pose.npy, fotos_rostro/, fotos_pose/, palabra.npz}."""
 
     def __init__(self, carpeta):
         self.carpeta = carpeta
         self._cache = {}
+
+    def crear(self, nombres):
+        """Crea la carpeta de cada persona, aunque todavia no tenga fotos registradas."""
+        for nombre in nombres:
+            os.makedirs(os.path.join(self.carpeta, nombre), exist_ok=True)
+
+    def cantidad(self, nombre, tipo):
+        """Numero de fotos registradas en el perfil."""
+        huellas = self.huellas(nombre, tipo)
+        return 0 if huellas is None else len(huellas)
+
+    def mas_parecido(self, tipo, huella):
+        """(nombre, parecido) del perfil registrado de ese tipo que mas se parece a la huella."""
+        nombres = os.listdir(self.carpeta) if os.path.isdir(self.carpeta) else []
+        parecidos = [(self.similitud(n, tipo, huella), n) for n in nombres]
+        return max(((s, n) for s, n in parecidos if s is not None), default=(None, None))[::-1]
 
     def huellas(self, nombre, tipo):
         if (nombre, tipo) not in self._cache:
@@ -153,6 +190,83 @@ class Perfiles:
         self._cache[nombre, tipo] = todas
         return len(todas)
 
+    def palabra(self, nombre):
+        """Huellas (MFCC) de las grabaciones de la palabra secreta, o None si no tiene."""
+        if (nombre, "palabra") not in self._cache:
+            ruta = os.path.join(self.carpeta, nombre, "palabra.npz")
+            if os.path.exists(ruta):
+                with np.load(ruta) as datos:
+                    self._cache[nombre, "palabra"] = [datos[k] for k in sorted(datos.files)]
+            else:
+                self._cache[nombre, "palabra"] = None
+        return self._cache[nombre, "palabra"]
+
+    def guardar_palabra(self, nombre, frases):
+        """Reemplaza la palabra secreta (solo sus huellas: ni audio ni texto)."""
+        os.makedirs(os.path.join(self.carpeta, nombre), exist_ok=True)
+        np.savez(os.path.join(self.carpeta, nombre, "palabra.npz"), *frases)
+        self._cache[nombre, "palabra"] = list(frases)
+
+    def distancia_palabra(self, nombre, frase):
+        """Diferencia entre la frase dicha y la palabra secreta (la grabacion mas parecida), o None."""
+        grabaciones = self.palabra(nombre)
+        return None if grabaciones is None else min(distancia_frases(frase, g) for g in grabaciones)
+
+    def palabra_mas_parecida(self, frase):
+        """(nombre, distancia) del perfil cuya palabra secreta mas se parece a la frase."""
+        nombres = os.listdir(self.carpeta) if os.path.isdir(self.carpeta) else []
+        distancias = [(self.distancia_palabra(n, frase), n) for n in nombres]
+        return min(((d, n) for d, n in distancias if d is not None), default=(None, None))[::-1]
+
+
+def coherencia_palabra(frases):
+    """Diferencia maxima entre las grabaciones del registro (deben parecerse entre si)."""
+    return max(distancia_frases(a, b) for a, b in itertools.combinations(frases, 2))
+
+
+def voz_de_frase(resultados):
+    """Persona que reconoce el modelo de voz mientras se dice una frase.
+
+    resultados: (nombre, probabilidad) de cada analisis del modelo durante la frase.
+    Devuelve (persona o None, motivo).
+    """
+    seguras = [n for n, p in resultados if p >= UMBRAL_CONFIANZA and n not in NO_PERSONAS]
+    if len(set(seguras)) > 1:
+        return None, "El modelo oye la voz de varias personas: " + ", ".join(sorted(set(seguras))) + "."
+    if seguras and len(seguras) < VECES_VOZ:
+        return None, (f"El modelo de voz reconoció a {seguras[0]} solo {len(seguras)} vez con "
+                      f"{UMBRAL_CONFIANZA:.0%} (hacen falta {VECES_VOZ}): habla más claro o un poco más largo.")
+    if len(seguras) < VECES_VOZ:
+        personas = [(p, n) for n, p in resultados if n not in NO_PERSONAS]
+        mejor = f" (lo más alto: {max(personas)[1]} {max(personas)[0]:.0%})" if personas else ""
+        return None, f"El modelo de voz no te reconoce con {UMBRAL_CONFIANZA:.0%}{mejor}."
+    return seguras[0], f"{seguras[0]}, reconocido {len(seguras)} veces con {UMBRAL_CONFIANZA:.0%} o más."
+
+
+def decidir_palabra(persona, perfiles, frase):
+    """Modo voz: la persona que reconoce el modelo debe haber dicho SU palabra secreta.
+
+    persona: resultado de voz_de_frase (o None). frase: huella de lo que se dijo.
+    Devuelve (persona o None, motivo, cuenta_como_fallo). Si ni la voz ni la palabra son de
+    nadie (otra gente hablando, ruido) no cuenta como intento fallido.
+    """
+    duena, distancia = perfiles.palabra_mas_parecida(frase)
+    if duena is None:
+        return None, "Nadie tiene palabra secreta: usa «Registrar palabra».", False
+    palabra_valida = distancia <= UMBRAL_PALABRA
+    if persona is None:
+        if palabra_valida:
+            return None, f"Es la palabra de {duena}, pero el modelo no reconoce su voz.", True
+        return None, "No reconozco ni la voz ni la palabra.", False
+    propia = perfiles.distancia_palabra(persona, frase)
+    if propia is None:
+        return None, f"{persona} no tiene palabra secreta (usa «Registrar palabra»).", False
+    if propia > UMBRAL_PALABRA:
+        return None, f"No es la palabra secreta de {persona} (diferencia {propia:.2f}, máximo {UMBRAL_PALABRA}).", True
+    if duena != persona:
+        return None, f"La frase se parece más a la palabra de {duena} que a la de {persona}.", True
+    return persona, f"Palabra secreta de {persona} correcta (diferencia {propia:.2f}).", False
+
 
 def decidir_identidad(resultados, perfiles, tipo, calcular_huella, umbral):
     """Decide quien es la persona.
@@ -170,11 +284,15 @@ def decidir_identidad(resultados, perfiles, tipo, calcular_huella, umbral):
         return "otros", f"Clase «{nombre}»."
     if min(p for _, p in resultados) < UMBRAL_CONFIANZA:
         return "otros", f"Confianza menor al {UMBRAL_CONFIANZA:.0%}."
-    similitud = perfiles.similitud(nombre, tipo, calcular_huella())
+    huella = calcular_huella()
+    similitud = perfiles.similitud(nombre, tipo, huella)
     if similitud is None:
         return "otros", f"{nombre} no tiene perfil de {tipo} registrado (usa «Registrar {tipo}»)."
     if similitud < umbral:
         return "otros", f"No coincide con el perfil de {nombre} (parecido {similitud:.2f}, mínimo {umbral})."
+    otro, parecido = perfiles.mas_parecido(tipo, huella)
+    if otro != nombre:
+        return "otros", f"Se parece más al perfil de {otro} ({parecido:.2f}) que al de {nombre} ({similitud:.2f})."
     return nombre, f"Coincide con el perfil de {nombre} (parecido {similitud:.2f})."
 
 
@@ -190,7 +308,7 @@ class Verificador:
         self.reiniciar()
 
     def iniciar(self, modo):
-        """Empieza a verificar con el modo 'imagen' (rostro) o 'pose'."""
+        """Empieza a verificar con el modo 'imagen' (rostro), 'pose' o 'voz'."""
         self.modo = modo
         self.reiniciar()
 
@@ -206,7 +324,36 @@ class Verificador:
         self.movimientos = []     # movimientos de la cabeza pedidos, al azar
         self.muestras = []        # ultimas posiciones de la cara mirando de frente
         self.referencia = None    # posicion de la cara mirando de frente (horizontal, vertical)
-        self.titulo, self.color = "Ponte frente a la cámara", NEGRO
+        self._esperar()
+
+    def _esperar(self):
+        """Titulo mientras no hay nadie delante de la camara (o nadie hablando)."""
+        self.titulo = "Di tu palabra secreta" if self.modo == "voz" else "Ponte frente a la cámara"
+        self.color = NEGRO
+
+    def esperar_frase(self, ahora, hablando):
+        """Modo voz: mientras no termina ninguna frase."""
+        if self.fase == "resultado":
+            if ahora < self.pausa_hasta:
+                return
+            self.reiniciar()
+        if hablando:
+            self.titulo, self.color = "Escuchando...", AZUL
+        else:
+            self._esperar()
+
+    def frase(self, ahora, persona, motivo, cuenta_como_fallo):
+        """Modo voz: termino una frase. persona = perfil cuya voz y palabra coinciden, o None."""
+        if self.fase == "resultado" and ahora < self.pausa_hasta:
+            return
+        if persona:
+            self.persona = persona
+            self._conceder(ahora)
+        elif cuenta_como_fallo:
+            self._fallar(ahora, motivo)
+        else:  # ruido u otra gente hablando: se avisa sin contar un intento
+            self.titulo, self.color = motivo, ROJO
+            self.fase, self.pausa_hasta = "resultado", ahora + 2
 
     @property
     def necesita(self):
@@ -305,7 +452,7 @@ class Verificador:
     def _paso_identidad(self, ahora, dato, confianza):
         if dato is None:  # nadie delante: no cuenta como intento
             self.inicio, self.candidato = None, None
-            self.titulo, self.color = "Ponte frente a la cámara", NEGRO
+            self._esperar()
             return
         if self.inicio is None:
             self.inicio = ahora

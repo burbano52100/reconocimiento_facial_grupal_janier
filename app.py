@@ -1,7 +1,8 @@
-"""Control de acceso con los modelos de Teachable Machine (rostro y pose).
+"""Control de acceso con los modelos de Teachable Machine (rostro, pose y voz).
 
 Ejecutar:  python app.py
 """
+import collections
 import math
 import os
 import threading
@@ -12,15 +13,19 @@ from tkinter import messagebox, ttk
 import cv2
 import numpy as np
 
-from modelos import (ESQUELETO, AnalizadorCaras, ClasificadorImagen, ClasificadorPose,
-                     recorte_cara, recorte_cuadrado)
-from seguridad import (AZUL, MAX_INTENTOS, NO_PERSONAS, ROJO, UMBRAL_GIRO, UMBRAL_POSE,
-                       UMBRAL_ROSTRO, VERDE, Perfiles, Verificador, decidir_identidad,
-                       detectar_gesto, mira_de_frente, orientacion_cara)
+from microfono import Microfono
+from modelos import (ESQUELETO, AnalizadorCaras, ClasificadorImagen, ClasificadorPose, ClasificadorVoz,
+                     DetectorFrase, Escucha, huella_frase, recorte_cara, recorte_cuadrado)
+from seguridad import (AZUL, MAX_INTENTOS, NIVEL_MINIMO_VOZ, NO_PERSONAS, REPETICIONES_PALABRA, ROJO,
+                       UMBRAL_GIRO, UMBRAL_PALABRA, UMBRAL_POSE, UMBRAL_ROSTRO, VERDE, Perfiles, Verificador,
+                       coherencia_palabra, decidir_identidad, decidir_palabra, detectar_gesto, mira_de_frente,
+                       orientacion_cara, voz_de_frase)
 
 CARPETA = os.path.dirname(os.path.abspath(__file__))
 LADO_VIDEO = 480
 FOTOS_REGISTRO = 10
+ESPECTROS_POR_PREDICCION = 5  # el modelo de voz se ejecuta cada 5 espectros (~0,12 s)
+MODOS_VOZ = ("voz", "registrar_palabra")  # modos que usan el microfono en vez de la camara
 VERDE_RGB, ROJO_RGB, AZUL_RGB = (0, 200, 0), (220, 0, 0), (30, 120, 255)
 AMARILLO_RGB, GRIS_RGB, BLANCO_RGB = (255, 200, 0), (170, 170, 170), (255, 255, 255)
 METAS = {"arriba": (0, -1), "abajo": (0, 1), "izquierda": (-1, 0), "derecha": (1, 0)}
@@ -30,6 +35,8 @@ BOTONES = [  # (modo, texto, fila, columna)
     ("registrar_imagen", "Registrar rostro", 0, 1),
     ("pose", "Reconocimiento por pose", 1, 0),
     ("registrar_pose", "Registrar pose", 1, 1),
+    ("voz", "Reconocimiento por voz", 2, 0),
+    ("registrar_palabra", "Registrar palabra", 2, 1),
 ]
 
 
@@ -66,14 +73,27 @@ def dibujar_guia(imagen, cara, escala, desplazamiento, reto):
     cv2.circle(imagen, punto, 14, BLANCO_RGB, 2, cv2.LINE_AA)
 
 
+def dibujar_espectrograma(espectros, minimo=-120, maximo=-40):
+    """Imagen del ultimo segundo de audio: el tiempo avanza a la derecha y los graves quedan abajo."""
+    niveles = np.clip((espectros.T[::-1] - minimo) / (maximo - minimo), 0, 1)
+    imagen = cv2.applyColorMap((niveles * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+    imagen = cv2.resize(imagen, (LADO_VIDEO, LADO_VIDEO), interpolation=cv2.INTER_NEAREST)
+    return cv2.cvtColor(imagen, cv2.COLOR_BGR2RGB)
+
+
 class App:
     def __init__(self, raiz):
         self.raiz = raiz
         self.modelo_imagen = ClasificadorImagen(os.path.join(CARPETA, "modelo_imagen", "keras_model.h5"),
                                                 os.path.join(CARPETA, "modelo_imagen", "labels.txt"))
         self.modelo_pose = ClasificadorPose(os.path.join(CARPETA, "modelo_pose"))
+        self.modelo_voz = ClasificadorVoz(os.path.join(CARPETA, "modelo_voz"))
         self.caras = None  # detector de caras: se carga la primera vez que se usa
+        # Personas de cada modelo (cada modelo tiene sus propias clases)
+        self.personas = {tipo: [e for e in modelo.etiquetas if e not in NO_PERSONAS] for tipo, modelo in
+                         (("rostro", self.modelo_imagen), ("pose", self.modelo_pose), ("voz", self.modelo_voz))}
         self.perfiles = Perfiles(os.path.join(CARPETA, "perfiles"))
+        self.perfiles.crear({nombre for nombres in self.personas.values() for nombre in nombres})
         self.verificador = Verificador(self.perfiles)
 
         self.modo = None        # modo elegido (ver BOTONES) o None si la camara esta apagada
@@ -88,6 +108,7 @@ class App:
         self.mensaje_acceso = None   # ventana de "acceso concedido"
         self.acceso_mostrado = 0     # para mostrar cada acceso una sola vez
         self.etiquetas_barras = None
+        self.detalle_voz = ""
 
         raiz.title("Control de acceso con Teachable Machine")
         raiz.configure(padx=12, pady=12)
@@ -119,6 +140,9 @@ class App:
         self.marco_barras.pack(fill="x", pady=6)
         self.texto_intentos = tk.Label(panel, font=("Segoe UI", 10, "bold"), anchor="w")
         self.texto_intentos.pack(fill="x")
+        self.marco_perfiles = tk.LabelFrame(panel, text="Perfiles", padx=6, pady=4)
+        self.marco_perfiles.pack(fill="x", pady=(8, 0))
+        self._pintar_perfiles()
         self.texto_estado = tk.Label(raiz, fg="gray", anchor="w")
         self.texto_estado.grid(row=1, column=0, columnspan=2, sticky="we", pady=(8, 0))
 
@@ -127,22 +151,23 @@ class App:
     # ---------------- botones ----------------
 
     def pulsar(self, modo):
-        if self.modo == modo:  # pulsar el boton activo apaga la camara
+        if self.modo == modo:  # pulsar el boton activo apaga la camara (o el microfono)
             self.modo = None
-            self.estado = "Cámara apagada. Elige una opción."
+            self.estado = ("Micrófono apagado" if modo in MODOS_VOZ else "Cámara apagada") + ". Elige una opción."
             return
         if modo.startswith("registrar"):
-            nombre = self._dialogo_registro(modo)
-            if not nombre:
+            respuesta = self._dialogo_registro(modo)
+            if not respuesta:
                 return
-            self.registro = dict(nombre=nombre, inicio=None, ultima=0, huellas=[], fotos=[])
+            nombre, texto = respuesta
+            self.registro = dict(nombre=nombre, texto=texto, inicio=None, ultima=0, huellas=[], fotos=[],
+                                 frases=[], aviso="")
         self.modo = modo
 
     def _dialogo_registro(self, modo):
-        """Pide el perfil (persona) a registrar. Devuelve su nombre o None."""
-        tipo = "rostro" if modo == "registrar_imagen" else "pose"
-        modelo = self.modelo_imagen if tipo == "rostro" else self.modelo_pose
-        personas = [e for e in modelo.etiquetas if e not in NO_PERSONAS]
+        """Pide el perfil (persona) a registrar. Devuelve (nombre, palabra secreta o None) o None."""
+        tipo = {"registrar_imagen": "rostro", "registrar_pose": "pose", "registrar_palabra": "palabra"}[modo]
+        personas = self.personas["voz" if tipo == "palabra" else tipo]
 
         ventana = tk.Toplevel(self.raiz, padx=14, pady=12)
         ventana.title(f"Registrar {tipo}")
@@ -151,11 +176,20 @@ class App:
         tk.Label(ventana, text="Perfil:").grid(row=0, column=0, sticky="w")
         nombre = ttk.Combobox(ventana, values=personas, state="readonly", width=26)
         nombre.grid(row=0, column=1, pady=4)
-        consejo = (f"Se tomarán {FOTOS_REGISTRO} fotos de tu cara. Mira a la cámara y mueve un poco la cabeza."
-                   if tipo == "rostro" else
-                   f"Se tomarán {FOTOS_REGISTRO} fotos de tu cuerpo. Colócate como cuando entrenaste el modelo de pose.")
+        palabra = tk.Entry(ventana, width=29)
+        if tipo == "palabra":
+            tk.Label(ventana, text="Palabra secreta:").grid(row=1, column=0, sticky="w")
+            palabra.grid(row=1, column=1, pady=4)
+        consejo = {
+            "rostro": f"Se tomarán {FOTOS_REGISTRO} fotos de tu cara. Mira a la cámara y mueve un poco la cabeza.",
+            "pose": f"Se tomarán {FOTOS_REGISTRO} fotos de tu cuerpo. Colócate como cuando entrenaste el modelo de pose.",
+            "palabra": (f"Escribe tu palabra o frase secreta y dila {REPETICIONES_PALABRA} veces, siempre igual, "
+                        "con una pausa después de cada vez. Mejor 2 a 5 sílabas (hasta 3 segundos).\n"
+                        "El modelo de voz tiene que reconocerte en cada grabación: así nadie puede crear "
+                        "la palabra de otro perfil. No se guarda el texto ni el audio, solo cómo suena."),
+        }[tipo]
         tk.Label(ventana, text=consejo, fg="gray25", wraplength=300, justify="left").grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+            row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         respuesta = []
 
@@ -163,12 +197,16 @@ class App:
             if not nombre.get():
                 messagebox.showwarning("Falta el perfil", "Elige el perfil a registrar.", parent=ventana)
                 return
-            respuesta.append(nombre.get())
+            if tipo == "palabra" and not palabra.get().strip():
+                messagebox.showwarning("Falta la palabra", "Escribe tu palabra secreta.", parent=ventana)
+                return
+            respuesta.append((nombre.get(), palabra.get().strip() or None))
             ventana.destroy()
 
         marco = tk.Frame(ventana)
-        marco.grid(row=2, column=0, columnspan=2, pady=(12, 0))
-        tk.Button(marco, text="Tomar fotos", command=aceptar).pack(side="left", padx=4)
+        marco.grid(row=3, column=0, columnspan=2, pady=(12, 0))
+        tk.Button(marco, text="Grabar palabra" if tipo == "palabra" else "Tomar fotos",
+                  command=aceptar).pack(side="left", padx=4)
         tk.Button(marco, text="Cancelar", command=ventana.destroy).pack(side="left", padx=4)
         ventana.grab_set()
         self.raiz.wait_window(ventana)
@@ -192,7 +230,7 @@ class App:
         try:
             if not camara.isOpened():
                 raise RuntimeError("No se pudo abrir la cámara.")
-            while self.modo:
+            while self.modo and self.modo not in MODOS_VOZ:  # la voz usa su propio hilo (_escuchar)
                 modo = self.modo
                 if modo != modo_anterior:
                     self.verificador.iniciar(modo)
@@ -232,7 +270,7 @@ class App:
                 dato, detalle, probabilidades, confianza = self._identidad_rostro(bgr, rgb, vista, escala)
                 info["etiquetas"] = self.modelo_imagen.etiquetas
             else:
-                dato, detalle, probabilidades, confianza = self._identidad_pose(rgb, vista, escala)
+                dato, detalle, probabilidades, confianza = self._identidad_pose(bgr, rgb, vista, escala)
                 info["etiquetas"] = self.modelo_pose.etiquetas
             info["probabilidades"] = probabilidades
         elif v.necesita == "gesto":
@@ -289,7 +327,8 @@ class App:
         detalle = f"Solo la cara: {n1} {p1:.0%}   ·   Foto completa: {n2} {p2:.0%}\n{motivo}"
         return dato, detalle, prob_cara, min(p1, p2)
 
-    def _identidad_pose(self, rgb, vista, escala):
+    def _identidad_pose(self, bgr, rgb, vista, escala):
+        """1) pose con su perfil, 2) la cara debe coincidir con el perfil de rostro de la misma persona."""
         probabilidades, huella, puntos, confianzas = self.modelo_pose.predecir(rgb)
         dibujar_esqueleto(vista, puntos * escala, confianzas)
         if min(confianzas[0], confianzas[5], confianzas[6]) < 0.5:
@@ -297,6 +336,17 @@ class App:
         nombre = self.modelo_pose.etiquetas[probabilidades.argmax()]
         p = float(probabilidades.max())
         dato, motivo = decidir_identidad([(nombre, p)], self.perfiles, "pose", lambda: huella, UMBRAL_POSE)
+        if dato not in ("otros", "falso"):  # la pose sola no distingue personas: se confirma con la cara
+            caras = self._analizador_caras().detectar(bgr)
+            if len(caras) != 1:
+                dato, motivo_cara = "otros", "debe verse una sola cara para confirmar quién eres."
+            else:
+                dato, motivo_cara = decidir_identidad(
+                    [(nombre, p)], self.perfiles, "rostro",
+                    lambda: self.caras.huella(self.caras.recorte_alineado(bgr, caras[0])), UMBRAL_ROSTRO)
+            motivo += "\nCara: " + motivo_cara
+            for cara in caras:
+                dibujar_cara(vista, cara, escala, ROJO_RGB if dato == "otros" else VERDE_RGB)
         return dato, f"Pose: {nombre} {p:.0%}\n{motivo}", probabilidades, p
 
     def _paso_registro(self, modo, bgr, rgb, vista, escala, ahora):
@@ -342,6 +392,115 @@ class App:
         return {"titulo": f"Registro de {r['nombre']}: foto {n}/{FOTOS_REGISTRO}", "color": AZUL,
                 "detalle": consejo}
 
+    # ---------------- microfono y modelo de voz (hilo aparte) ----------------
+
+    def _escuchar(self):
+        self.estado = "Abriendo el micrófono..."
+        voz = self.modelo_voz
+        try:
+            microfono = Microfono(voz.FRECUENCIA, voz.SALTO)
+        except Exception as e:
+            self.error = str(e)
+            return
+        escucha = Escucha(voz, ESPECTROS_POR_PREDICCION)
+        detector = DetectorFrase(NIVEL_MINIMO_VOZ)
+        analisis = collections.deque(maxlen=60)  # (numero de espectro, probabilidades) de los ultimos ~7 s
+        info = {"titulo": "Escuchando...", "color": AZUL, "detalle": ""}
+        modo_anterior = None
+        try:
+            while self.modo in MODOS_VOZ:
+                modo = self.modo
+                if modo != modo_anterior:
+                    self.verificador.iniciar(modo)
+                    self.estado = "Pulsa el mismo botón para apagar el micrófono."
+                    modo_anterior = modo
+
+                if escucha.agregar(microfono.leer()):
+                    analisis.append((escucha.llenos, voz.predecir(escucha.espectros)))
+                frase = detector.actualizar(escucha)
+                vista = dibujar_espectrograma(escucha.espectros)
+                ahora = time.monotonic()
+                if ahora < self.verificador.bloqueado_hasta:
+                    vista = vista // 3
+                    info = {"titulo": "Aplicación bloqueada", "color": ROJO, "detalle": ""}
+                elif analisis:
+                    resultado = None if frase is None else self._voz_y_palabra(frase, analisis)
+                    paso = self._paso_registro_palabra if modo == "registrar_palabra" else self._paso_voz
+                    info = paso(escucha, detector, resultado, ahora)
+                    info.update(etiquetas=voz.etiquetas, probabilidades=analisis[-1][1])
+                if self.modo == modo:
+                    self.resultado = (vista, info)
+        except Exception as e:
+            self.error = str(e)
+        finally:
+            microfono.cerrar()
+
+    def _voz_y_palabra(self, frase, analisis):
+        """De una frase recien dicha: (persona que reconoce el modelo de voz, motivo, huella de lo dicho)."""
+        espectros, primero, _ = frase
+        etiquetas = self.modelo_voz.etiquetas
+        resultados = [(etiquetas[p.argmax()], float(p.max())) for numero, p in analisis if numero >= primero + 5]
+        persona, motivo = voz_de_frase(resultados)
+        return persona, motivo, huella_frase(espectros)
+
+    @staticmethod
+    def _texto_volumen(escucha, detector):
+        aviso = f"\n{detector.aviso}" if detector.aviso else ""
+        return f"Volumen: {escucha.nivel:.0f} dB (mínimo {NIVEL_MINIMO_VOZ}){aviso}"
+
+    def _paso_voz(self, escucha, detector, resultado, ahora):
+        """Entrar con la palabra secreta: la voz y la palabra deben ser del mismo perfil."""
+        v = self.verificador
+        if resultado is not None and not (v.fase == "resultado" and ahora < v.pausa_hasta):
+            persona, motivo_voz, frase = resultado
+            persona, motivo, cuenta_como_fallo = decidir_palabra(persona, self.perfiles, frase)
+            v.frase(ahora, persona, "voz o palabra incorrecta." if cuenta_como_fallo else "No te reconozco.",
+                    cuenta_como_fallo)
+            self.detalle_voz = f"Voz: {motivo_voz}\nPalabra: {motivo}"
+        else:
+            v.esperar_frase(ahora, detector.hablando)
+            if v.fase != "resultado":
+                self.detalle_voz = ("Di tu palabra secreta y calla: la app reconoce tu perfil sola.\n"
+                                    + self._texto_volumen(escucha, detector))
+        return dict(titulo=v.titulo, color=v.color, detalle=self.detalle_voz,
+                    intentos=f"Intentos fallidos: {v.fallos}/{MAX_INTENTOS}")
+
+    def _paso_registro_palabra(self, escucha, detector, resultado, ahora):
+        r = self.registro
+        if r["inicio"] is None:
+            r["inicio"] = ahora
+        espera = 2 - (ahora - r["inicio"])
+        if espera > 0:
+            return {"titulo": f"Palabra secreta de {r['nombre']}: prepárate... {math.ceil(espera)}",
+                    "color": AZUL, "detalle": f"Cuando empiece, di «{r['texto']}» y calla."}
+
+        if resultado is not None:
+            persona, motivo_voz, frase = resultado
+            if persona != r["nombre"]:  # solo la persona del perfil puede crear su palabra
+                r["aviso"] = (f"✘ No vale: {motivo_voz}" if persona is None else
+                              f"✘ No vale: el modelo de voz oye a {persona}, no a {r['nombre']}.")
+            else:
+                r["frases"].append(frase)
+                r["aviso"] = f"✔ Grabación {len(r['frases'])} correcta."
+            if len(r["frases"]) == REPETICIONES_PALABRA:
+                diferencia = coherencia_palabra(r["frases"])
+                if diferencia > UMBRAL_PALABRA:
+                    r["frases"] = []
+                    r["aviso"] = (f"✘ Las {REPETICIONES_PALABRA} grabaciones no se parecen (diferencia {diferencia:.2f}, "
+                                  f"máximo {UMBRAL_PALABRA}). Empieza otra vez y dila siempre igual.")
+                else:
+                    self.perfiles.guardar_palabra(r["nombre"], r["frases"])
+                    self.aviso = (f"Palabra secreta guardada para {r['nombre']}.\n"
+                                  "Ya puede entrar diciéndola en «Reconocimiento por voz».")
+                    self.modo = None
+                    self.estado = "Registro completado."
+
+        n = min(len(r["frases"]) + 1, REPETICIONES_PALABRA)
+        return {"titulo": f"Palabra secreta de {r['nombre']}: grabación {n}/{REPETICIONES_PALABRA}",
+                "color": AZUL, "detalle": (f"Di «{r['texto']}» y calla un momento."
+                                           + ("  (escuchando...)" if detector.hablando else "")
+                                           + f"\n{r['aviso']}\n" + self._texto_volumen(escucha, detector))}
+
     # ---------------- interfaz (hilo principal) ----------------
 
     def _refrescar(self):
@@ -351,13 +510,15 @@ class App:
             messagebox.showerror("Error", error)
         if self.aviso:
             aviso, self.aviso = self.aviso, None
+            self._pintar_perfiles()
             messagebox.showinfo("Registro completado", aviso)
 
         if self.modo != self.modo_pintado:
             self._pintar_modo()
-        # Arranca el hilo de la camara si hay un modo elegido y no esta corriendo
+        # Arranca el hilo de la camara (o del microfono) si hay un modo elegido y no esta corriendo
         if self.modo and not (self.hilo and self.hilo.is_alive()):
-            self.hilo = threading.Thread(target=self._trabajar, daemon=True)
+            trabajo = self._escuchar if self.modo in MODOS_VOZ else self._trabajar
+            self.hilo = threading.Thread(target=trabajo, daemon=True)
             self.hilo.start()
 
         resultado, self.resultado = self.resultado, None
@@ -399,13 +560,37 @@ class App:
             hijo.destroy()
         self.barras = []
         for fila, etiqueta in enumerate(etiquetas):
-            tk.Label(self.marco_barras, text=etiqueta, width=10, anchor="w").grid(row=fila, column=0)
+            tk.Label(self.marco_barras, text=etiqueta, width=15, anchor="w").grid(row=fila, column=0)
             barra = ttk.Progressbar(self.marco_barras, length=200, maximum=100)
             barra.grid(row=fila, column=1, pady=2)
             porcentaje = tk.Label(self.marco_barras, width=5, anchor="e")
             porcentaje.grid(row=fila, column=2)
             self.barras.append((barra, porcentaje))
         self.etiquetas_barras = etiquetas
+
+    def _pintar_perfiles(self):
+        """Tabla con lo que tiene cada perfil: fotos registradas de rostro y pose; la voz usa solo el modelo."""
+        for hijo in self.marco_perfiles.winfo_children():
+            hijo.destroy()
+        nombres = sorted({nombre for nombres in self.personas.values() for nombre in nombres})
+        for columna, texto in enumerate(["", "Rostro", "Pose", "Voz"]):
+            tk.Label(self.marco_perfiles, text=texto, font=("Segoe UI", 9, "bold"), width=11 if columna else 10,
+                     anchor="w").grid(row=0, column=columna)
+        for fila, nombre in enumerate(nombres, 1):
+            tk.Label(self.marco_perfiles, text=nombre, width=10, anchor="w").grid(row=fila, column=0)
+            for columna, tipo in enumerate(["rostro", "pose", "voz"], 1):
+                if nombre not in self.personas[tipo]:
+                    texto, color = "—", "gray"
+                elif tipo == "voz":
+                    texto, color = ("✔ palabra", VERDE) if self.perfiles.palabra(nombre) else ("sin palabra", ROJO)
+                else:
+                    n = self.perfiles.cantidad(nombre, tipo)
+                    texto, color = (f"✔ {n} fotos", VERDE) if n else ("sin registrar", ROJO)
+                tk.Label(self.marco_perfiles, text=texto, fg=color, width=11, anchor="w").grid(row=fila, column=columna)
+        tk.Label(self.marco_perfiles, text="—: esa persona no está en ese modelo.   Sin registrar: usa "
+                 "«Registrar rostro / pose / palabra». La pose también necesita el rostro registrado.",
+                 fg="gray25", font=("Segoe UI", 8),
+                 wraplength=380, justify="left").grid(row=len(nombres) + 1, column=0, columnspan=4, sticky="w")
 
     def _revisar_acceso(self):
         """Muestra automaticamente el mensaje de acceso concedido con el perfil, y lo cierra solo."""

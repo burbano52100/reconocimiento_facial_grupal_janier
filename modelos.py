@@ -1,10 +1,13 @@
-"""Ejecuta los dos modelos de Teachable Machine usando solo numpy.
+"""Ejecuta los tres modelos de Teachable Machine usando solo numpy.
 
 - ClasificadorImagen: modelo Keras (.h5) = MobileNetV2 + capas densas.
 - ClasificadorPose:   modelo TF.js de pose = PoseNet (MobileNetV1) + capas densas.
+- ClasificadorVoz:    modelo TF.js de audio = espectrograma + red convolucional (speech-commands).
+- DetectorFrase:      recorta cada frase hablada; huella_frase / distancia_frases comparan palabras.
 - AnalizadorCaras:    detector de caras (YuNet) + huella facial (SFace) de OpenCV.
 """
 import base64
+import collections
 import json
 import os
 import urllib.request
@@ -315,6 +318,205 @@ class ClasificadorPose:
                 huella = x / (np.linalg.norm(x) or 1)
         puntos, confianzas = self.posenet.puntos_clave(heatmaps, offsets, imagen_rgb.shape[0])
         return x, huella, puntos, confianzas
+
+
+# ---------------------------------------------------------------------------
+# Modelo 3: voz (TF.js speech-commands)
+# ---------------------------------------------------------------------------
+
+
+class ClasificadorVoz:
+    """Modelo de audio de Teachable Machine (model.json + weights.bin + metadata.json).
+
+    Calcula el espectrograma igual que el navegador: cada SALTO muestras (a FRECUENCIA Hz) toma las
+    ultimas 2 * SALTO, aplica la ventana de Blackman y guarda en decibelios las primeras frecuencias.
+    El modelo mira los ultimos espectros (unos 43 = 1 segundo).
+    """
+    FRECUENCIA = 44100
+    SALTO = 1024
+
+    def __init__(self, carpeta):
+        with open(os.path.join(carpeta, "metadata.json"), encoding="utf-8") as f:
+            metadata = json.load(f)
+        with open(os.path.join(carpeta, "model.json"), encoding="utf-8") as f:
+            modelo = json.load(f)
+        self.etiquetas = [e.strip() for e in metadata["wordLabels"]]
+        self.pesos = _leer_pesos_tfjs(modelo["weightsManifest"], carpeta)
+
+        capas = modelo["modelTopology"]["config"]["layers"]
+        _, self.num_espectros, self.num_frecuencias, _ = capas[0]["config"]["batch_input_shape"]
+        self.capas = []
+        for capa in capas:  # el modelo es una cadena de capas; la ultima es un Sequential con la capa nueva
+            if capa["class_name"] == "Sequential":
+                self.capas += capa["config"]["layers"]
+            elif capa["class_name"] not in ("InputLayer", "Dropout"):
+                self.capas.append(capa)
+
+        n = np.arange(2 * self.SALTO)
+        self.ventana = 0.42 - 0.5 * np.cos(np.pi * n / self.SALTO) + 0.08 * np.cos(2 * np.pi * n / self.SALTO)
+
+    def espectro(self, audio):
+        """Una fila del espectrograma (en dB) a partir de las ultimas 2 * SALTO muestras."""
+        x = audio[-2 * self.SALTO:] * self.ventana
+        magnitud = np.abs(np.fft.rfft(x)[:self.num_frecuencias]) / len(x)
+        return 20 * np.log10(np.maximum(magnitud, 1e-10))
+
+    def predecir(self, espectrograma):
+        """espectrograma: num_espectros x num_frecuencias (dB). Devuelve las probabilidades de cada clase."""
+        x = (espectrograma - espectrograma.mean()) / (espectrograma.std() + 1e-7)  # como TF.js
+        x = x[:, :, None].astype(np.float32)
+        for capa in self.capas:
+            tipo, cfg = capa["class_name"], capa["config"]
+            if tipo == "Conv2D":
+                x = self._convolucion(x, self.pesos[cfg["name"] + "/kernel"]) + self.pesos[cfg["name"] + "/bias"]
+            elif tipo == "MaxPooling2D":
+                x = self._max_pooling(x, cfg["pool_size"], cfg["strides"])
+            elif tipo == "Flatten":
+                x = x.reshape(-1)
+            elif tipo == "Dense":
+                x = x @ self.pesos[cfg["name"] + "/kernel"] + self.pesos[cfg["name"] + "/bias"]
+            else:
+                raise ValueError(f"Capa no soportada: {tipo}")
+            x = activacion(x, cfg.get("activation"))
+        return x
+
+    @staticmethod
+    def _convolucion(x, kernel):
+        """Conv2D con padding='valid' y kernel rectangular."""
+        kh, kw, _, c_out = kernel.shape
+        alto, ancho = x.shape[0] - kh + 1, x.shape[1] - kw + 1
+        salida = np.zeros((alto, ancho, c_out), np.float32)
+        for ky in range(kh):
+            for kx in range(kw):
+                salida += x[ky:ky + alto, kx:kx + ancho] @ kernel[ky, kx]
+        return salida
+
+    @staticmethod
+    def _max_pooling(x, tamano, salto):
+        (ph, pw), (sh, sw) = tamano, salto
+        alto, ancho = (x.shape[0] - ph) // sh + 1, (x.shape[1] - pw) // sw + 1
+        return np.max([x[y:y + sh * (alto - 1) + 1:sh, xx:xx + sw * (ancho - 1) + 1:sw]
+                       for y in range(ph) for xx in range(pw)], axis=0)
+
+
+class Escucha:
+    """Convierte el audio que va llegando en el espectrograma del ultimo segundo (y su volumen)."""
+
+    def __init__(self, modelo, cada=11):
+        self.modelo = modelo
+        self.cada = cada  # se ejecuta el modelo cada 'cada' espectros nuevos (11 = ~0,25 s)
+        self.audio = np.zeros(0, np.float32)  # muestras que aun no forman un espectro
+        self.espectros = np.full((modelo.num_espectros, modelo.num_frecuencias), -200.0)
+        self.niveles = np.full(modelo.num_espectros, -200.0)  # volumen de cada espectro (dBFS)
+        self.historial = collections.deque(maxlen=200)  # (numero, espectro, volumen) de los ultimos ~4,6 s
+        self.llenos = self.nuevos = 0  # llenos = numero del ultimo espectro calculado
+
+    @property
+    def nivel(self):
+        """Volumen del momento mas fuerte del ultimo segundo, en dBFS (0 = maximo del microfono)."""
+        return float(self.niveles.max())
+
+    def agregar(self, muestras):
+        """Suma audio nuevo. Devuelve True si ya toca ejecutar el modelo."""
+        salto = self.modelo.SALTO
+        self.audio = np.concatenate([self.audio, muestras])
+        while len(self.audio) >= 2 * salto:
+            self.espectros = np.roll(self.espectros, -1, axis=0)
+            self.espectros[-1] = self.modelo.espectro(self.audio[:2 * salto])
+            self.niveles = np.roll(self.niveles, -1)
+            self.niveles[-1] = 10 * np.log10(np.mean(self.audio[salto:2 * salto] ** 2) + 1e-20)
+            self.audio = self.audio[salto:]
+            self.llenos, self.nuevos = self.llenos + 1, self.nuevos + 1
+            self.historial.append((self.llenos, self.espectros[-1].copy(), self.niveles[-1]))
+        if self.llenos >= self.modelo.num_espectros and self.nuevos >= self.cada:
+            self.nuevos = 0
+            return True
+        return False
+
+
+class DetectorFrase:
+    """Recorta cada frase hablada (voz entre dos silencios) a partir de los espectros de Escucha.
+
+    Hay voz cuando el volumen supera el minimo y el ruido de fondo (que se va midiendo) en 'margen' dB.
+    """
+    SILENCIO_FINAL = 17         # espectros sin voz que cierran la frase (~0,4 s)
+    MINIMO, MAXIMO = 11, 130    # duracion valida de la frase en espectros (~0,25 s a ~3 s)
+
+    def __init__(self, nivel_minimo, margen=12):
+        self.nivel_minimo, self.margen = nivel_minimo, margen
+        self.ruido = None    # volumen del ruido de fondo (dB)
+        self.frase = None    # [(numero, espectro)] de la frase en curso
+        self.anterior = None
+        self.silencio = 0
+        self.visto = 0       # ultimo espectro revisado
+        self.aviso = ""
+
+    @property
+    def hablando(self):
+        return self.frase is not None
+
+    def actualizar(self, escucha):
+        """Revisa los espectros nuevos. Devuelve (espectros, primero, ultimo) si acaba de terminar una frase."""
+        terminada = None
+        for numero, espectro, nivel in escucha.historial:
+            if numero <= self.visto:
+                continue
+            self.visto = numero
+            if self.ruido is None:
+                self.ruido = nivel
+            voz = nivel >= max(self.nivel_minimo, self.ruido + self.margen)
+            if self.frase is None:
+                if voz:
+                    self.frase, self.silencio = [self.anterior or (numero, espectro), (numero, espectro)], 0
+                else:
+                    self.ruido = 0.95 * self.ruido + 0.05 * nivel
+                self.anterior = (numero, espectro)
+                continue
+            self.frase.append((numero, espectro))
+            self.silencio = 0 if voz else self.silencio + 1
+            if len(self.frase) > self.MAXIMO:  # no para de sonar: es ruido o alguien hablando sin pausa
+                self.aviso = "Frase demasiado larga (máximo 3 s): di solo tu palabra y calla."
+                self.frase, self.ruido = None, nivel
+            elif self.silencio >= self.SILENCIO_FINAL:
+                frase = self.frase[:len(self.frase) - self.silencio + 2]
+                self.frase = None
+                if len(frase) >= self.MINIMO:
+                    terminada = (np.array([e for _, e in frase]), frase[0][0], frase[-1][0])
+                    self.aviso = ""
+                else:
+                    self.aviso = "Sonido demasiado corto."
+        return terminada
+
+
+def _banco_mel(n_frecuencias, filtros=26, minimo=100, maximo=4900, frecuencia=44100, n_fft=2048):
+    """Filtros triangulares en escala mel (como el oido): (n_frecuencias, filtros)."""
+    mel = np.linspace(2595 * np.log10(1 + minimo / 700), 2595 * np.log10(1 + maximo / 700), filtros + 2)
+    centros = 700 * (10 ** (mel / 2595) - 1) * n_fft / frecuencia  # en posiciones del espectro
+    k = np.arange(n_frecuencias)[:, None]
+    izquierda, centro, derecha = centros[:-2], centros[1:-1], centros[2:]
+    return np.maximum(0, np.minimum((k - izquierda) / (centro - izquierda), (derecha - k) / (derecha - centro)))
+
+
+def huella_frase(espectros, coeficientes=12):
+    """MFCC de una frase: como suena cada momento, sin depender del volumen ni del microfono."""
+    energia = np.log((10 ** (np.asarray(espectros) / 10)) @ _banco_mel(espectros.shape[1]) + 1e-12)
+    n = energia.shape[1]
+    dct = np.cos(np.pi / n * (np.arange(n) + 0.5)[None, :] * np.arange(1, coeficientes + 1)[:, None])
+    mfcc = energia @ dct.T
+    return (mfcc - mfcc.mean(axis=0)).astype(np.float32)
+
+
+def distancia_frases(a, b):
+    """Diferencia entre dos frases (0 = iguales). DTW: alinea las frases aunque se digan a distinto ritmo."""
+    coste = np.sqrt(((a[:, None, :] - b[None, :, :]) ** 2).mean(axis=2)).tolist()
+    n, m = len(a), len(b)
+    anterior = [0.0] + [float("inf")] * m
+    for i in range(1, n + 1):
+        fila, actual = coste[i - 1], [float("inf")] * (m + 1)
+        for j in range(1, m + 1):
+            actual[j] = fila[j - 1] + min(anterior[j], actual[j - 1], anterior[j - 1])
+        anterior = actual
+    return anterior[m] / (n + m)
 
 
 # ---------------------------------------------------------------------------
