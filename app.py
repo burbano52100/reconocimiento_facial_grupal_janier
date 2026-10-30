@@ -16,9 +16,10 @@ import numpy as np
 from microfono import Microfono
 from modelos import (ESQUELETO, AnalizadorCaras, ClasificadorImagen, ClasificadorPose, ClasificadorVoz,
                      DetectorFrase, Escucha, recorte_cara, recorte_cuadrado)
-from seguridad import (AZUL, MAX_INTENTOS, NIVEL_MINIMO_VOZ, NO_PERSONAS, OTROS, ROJO, UMBRAL_CONFIANZA,
-                       UMBRAL_GIRO, UMBRAL_POSE, UMBRAL_ROSTRO, VERDE, Perfiles, Verificador, decidir_identidad,
-                       detectar_gesto, mira_de_frente, orientacion_cara, voz_de_frase)
+from seguridad import (AZUL, MAX_INTENTOS, NIVEL_MINIMO_VOZ, NO_PERSONAS, OTROS, ROJO, UMBRAL_CORRECCION_POSE,
+                       UMBRAL_CORRECCION_ROSTRO, UMBRAL_GIRO, UMBRAL_POSE, UMBRAL_ROSTRO, UMBRAL_VOZ, VERDE,
+                       Perfiles, Verificador, decidir_identidad, detectar_gesto, mira_de_frente, orientacion_cara,
+                       voz_de_frase)
 
 CARPETA = os.path.dirname(os.path.abspath(__file__))
 LADO_VIDEO = 480
@@ -28,6 +29,8 @@ MODOS_VOZ = ("voz",)  # modos que usan el microfono en vez de la camara
 VERDE_RGB, ROJO_RGB, AZUL_RGB = (0, 200, 0), (220, 0, 0), (30, 120, 255)
 AMARILLO_RGB, GRIS_RGB, BLANCO_RGB = (255, 200, 0), (170, 170, 170), (255, 255, 255)
 METAS = {"arriba": (0, -1), "abajo": (0, 1), "izquierda": (-1, 0), "derecha": (1, 0)}
+# Orden en que se buscan las camaras: primero las externas (USB) y, si no hay, la del portatil (0)
+CAMARAS = (1, 2, 3, 0)
 
 BOTONES = [  # (modo, texto, fila, columna)
     ("imagen", "Reconocimiento facial", 0, 0),
@@ -36,6 +39,17 @@ BOTONES = [  # (modo, texto, fila, columna)
     ("registrar_pose", "Registrar pose", 1, 1),
     ("voz", "Reconocimiento por voz", 2, 0),
 ]
+
+
+def abrir_camara():
+    """Abre la primera camara de CAMARAS que de imagen. Devuelve (camara, indice)."""
+    for indice in CAMARAS:
+        for api in (cv2.CAP_DSHOW, cv2.CAP_ANY):
+            camara = cv2.VideoCapture(indice, api)
+            if camara.isOpened() and camara.read()[0]:
+                return camara, indice
+            camara.release()
+    raise RuntimeError("No se pudo abrir ninguna cámara (ni externa ni la del portátil).")
 
 
 def dibujar_esqueleto(imagen, puntos, confianzas, minimo=0.4):
@@ -208,19 +222,17 @@ class App:
         return self.caras
 
     def _trabajar(self):
-        self.estado = "Abriendo la cámara..."
-        camara = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-        if not camara.isOpened():
-            camara = cv2.VideoCapture(0)
+        self.estado = "Buscando la cámara..."
+        camara = None
         modo_anterior = None
         try:
-            if not camara.isOpened():
-                raise RuntimeError("No se pudo abrir la cámara.")
+            camara, indice = abrir_camara()
+            nombre_camara = "cámara del portátil" if indice == 0 else f"cámara externa ({indice})"
             while self.modo and self.modo not in MODOS_VOZ:  # la voz usa su propio hilo (_escuchar)
                 modo = self.modo
                 if modo != modo_anterior:
                     self.verificador.iniciar(modo)
-                    self.estado = "Pulsa el mismo botón para apagar la cámara."
+                    self.estado = f"Usando la {nombre_camara}. Pulsa el mismo botón para apagarla."
                     modo_anterior = modo
 
                 ok, cuadro = camara.read()
@@ -245,7 +257,8 @@ class App:
         except Exception as e:
             self.error = str(e)
         finally:
-            camara.release()
+            if camara is not None:
+                camara.release()
 
     def _paso_verificacion(self, modo, bgr, rgb, vista, escala, ahora):
         v = self.verificador
@@ -306,7 +319,7 @@ class App:
         resultados = [(etiquetas[p.argmax()], float(p.max())) for p in (prob_cara, prob_foto)]
         dato, motivo = decidir_identidad(
             resultados, self.perfiles, "rostro",
-            lambda: self.caras.huella(self.caras.recorte_alineado(bgr, cara)), UMBRAL_ROSTRO)
+            lambda: self.caras.huella(self.caras.recorte_alineado(bgr, cara)), UMBRAL_ROSTRO, UMBRAL_CORRECCION_ROSTRO)
 
         dibujar_cara(vista, cara, escala, ROJO_RGB if dato in ("otros", "falso") else VERDE_RGB)
         (n1, p1), (n2, p2) = resultados
@@ -321,14 +334,15 @@ class App:
             return None, "No se detecta una persona (deben verse la cabeza y los hombros).", probabilidades, None
         nombre = self.modelo_pose.etiquetas[probabilidades.argmax()]
         p = float(probabilidades.max())
-        dato, motivo = decidir_identidad([(nombre, p)], self.perfiles, "pose", lambda: huella, UMBRAL_POSE)
+        dato, motivo = decidir_identidad([(nombre, p)], self.perfiles, "pose", lambda: huella, UMBRAL_POSE,
+                                         UMBRAL_CORRECCION_POSE)
         if dato not in ("otros", "falso"):  # la pose sola no distingue personas: se confirma con la cara
             caras = self._analizador_caras().detectar(bgr)
             if len(caras) != 1:
                 dato, motivo_cara = "otros", "debe verse una sola cara para confirmar quién eres."
             else:
-                dato, motivo_cara = decidir_identidad(
-                    [(nombre, p)], self.perfiles, "rostro",
+                dato, motivo_cara = decidir_identidad(  # la cara debe ser de la persona que dio la pose
+                    [(dato, p)], self.perfiles, "rostro",
                     lambda: self.caras.huella(self.caras.recorte_alineado(bgr, caras[0])), UMBRAL_ROSTRO)
             motivo += "\nCara: " + motivo_cara
             for cara in caras:
@@ -444,7 +458,7 @@ class App:
             v.esperar_frase(ahora, detector.hablando)
             if v.fase != "resultado":
                 self.detalle_voz = (f"Di tu palabra clave y calla: entras al perfil que el modelo reconozca "
-                                    f"con {UMBRAL_CONFIANZA:.0%} o más.\n" + self._texto_volumen(escucha, detector))
+                                    f"con {UMBRAL_VOZ:.0%} o más.\n" + self._texto_volumen(escucha, detector))
         return dict(titulo=v.titulo, color=v.color, detalle=self.detalle_voz,
                     intentos=f"Intentos fallidos: {v.fallos}/{MAX_INTENTOS}")
 

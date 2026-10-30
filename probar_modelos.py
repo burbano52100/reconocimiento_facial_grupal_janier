@@ -42,9 +42,10 @@ def _carpeta(persona):
 
 def tomar_fotos(persona, cantidad=20):
     carpeta = _carpeta(persona)
-    camara = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-    if not camara.isOpened():
-        sys.exit("No se pudo abrir la cámara.")
+    try:
+        camara, _ = app.abrir_camara()
+    except RuntimeError as e:
+        sys.exit(str(e))
     print(f"Se tomarán {cantidad} fotos de {persona}, una cada medio segundo. Muévete un poco entre fotos.")
     for n in (3, 2, 1):
         print(f"  {n}...")
