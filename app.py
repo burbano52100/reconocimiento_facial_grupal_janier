@@ -17,7 +17,8 @@ from microfono import Microfono
 from modelos import (ESQUELETO, AnalizadorCaras, ClasificadorImagen, ClasificadorPose, ClasificadorVoz,
                      DetectorFrase, Escucha, huella_frase, recorte_cara, recorte_cuadrado)
 from seguridad import (AZUL, MAX_INTENTOS, NIVEL_MINIMO_VOZ, NO_PERSONAS, REPETICIONES_PALABRA, ROJO,
-                       UMBRAL_GIRO, UMBRAL_PALABRA, UMBRAL_POSE, UMBRAL_ROSTRO, VERDE, Perfiles, Verificador,
+                       UMBRAL_CORRECCION_POSE, UMBRAL_CORRECCION_ROSTRO, UMBRAL_GIRO, UMBRAL_PALABRA,
+                       UMBRAL_POSE, UMBRAL_ROSTRO, VERDE, Perfiles, Verificador,
                        coherencia_palabra, decidir_identidad, decidir_palabra, detectar_gesto, mira_de_frente,
                        orientacion_cara, voz_de_frase)
 
@@ -332,7 +333,7 @@ class App:
         resultados = [(etiquetas[p.argmax()], float(p.max())) for p in (prob_cara, prob_foto)]
         dato, motivo = decidir_identidad(
             resultados, self.perfiles, "rostro",
-            lambda: self.caras.huella(self.caras.recorte_alineado(bgr, cara)), UMBRAL_ROSTRO)
+            lambda: self.caras.huella(self.caras.recorte_alineado(bgr, cara)), UMBRAL_ROSTRO, UMBRAL_CORRECCION_ROSTRO)
 
         dibujar_cara(vista, cara, escala, ROJO_RGB if dato in ("otros", "falso") else VERDE_RGB)
         (n1, p1), (n2, p2) = resultados
@@ -347,14 +348,15 @@ class App:
             return None, "No se detecta una persona (deben verse la cabeza y los hombros).", probabilidades, None
         nombre = self.modelo_pose.etiquetas[probabilidades.argmax()]
         p = float(probabilidades.max())
-        dato, motivo = decidir_identidad([(nombre, p)], self.perfiles, "pose", lambda: huella, UMBRAL_POSE)
+        dato, motivo = decidir_identidad([(nombre, p)], self.perfiles, "pose", lambda: huella, UMBRAL_POSE,
+                                         UMBRAL_CORRECCION_POSE)
         if dato not in ("otros", "falso"):  # la pose sola no distingue personas: se confirma con la cara
             caras = self._analizador_caras().detectar(bgr)
             if len(caras) != 1:
                 dato, motivo_cara = "otros", "debe verse una sola cara para confirmar quién eres."
             else:
-                dato, motivo_cara = decidir_identidad(
-                    [(nombre, p)], self.perfiles, "rostro",
+                dato, motivo_cara = decidir_identidad(  # la cara debe ser de la persona que dio la pose
+                    [(dato, p)], self.perfiles, "rostro",
                     lambda: self.caras.huella(self.caras.recorte_alineado(bgr, caras[0])), UMBRAL_ROSTRO)
             motivo += "\nCara: " + motivo_cara
             for cara in caras:

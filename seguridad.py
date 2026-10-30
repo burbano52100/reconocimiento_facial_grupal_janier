@@ -4,6 +4,8 @@ Cada intento de acceso empieza igual:
   1. identidad  -> los modelos reconocen a la misma persona con >= 85 % (UMBRAL_CONFIANZA) durante 1 segundo
                    y coincide con su perfil registrado, y ese perfil es el que mas se parece de
                    todos los registrados. Si no: "otros" (desconocido).
+                   Si el modelo confunde a las personas, decide el perfil cuando el parecido es muy
+                   alto (UMBRAL_CORRECCION_ROSTRO / UMBRAL_CORRECCION_POSE).
                    Pose: ademas la cara debe coincidir con el perfil de rostro de esa persona
                    (probado con 610 fotos de desconocidos: el modelo de pose solo dice "burbano"
                    al 90 % en el 79 % de ellas).
@@ -39,6 +41,11 @@ UMBRAL_VOZ = 0.90           # probabilidad minima del modelo de voz
 SEGUNDOS_CONSTANCIA = 1.0   # tiempo que debe mantenerse el mismo resultado
 UMBRAL_ROSTRO = 0.40        # parecido minimo con el perfil de rostro registrado (0 a 1)
 UMBRAL_POSE = 0.85          # parecido minimo con el perfil de pose registrado (0 a 1)
+# Parecido con el perfil que corrige al modelo cuando confunde a las personas (ver decidir_identidad).
+# Medido con las fotos registradas: rostro propio 0,81-0,98, de otra persona 0,50 como mucho;
+# pose propia 0,99, de otra persona 0,78 como mucho.
+UMBRAL_CORRECCION_ROSTRO = 0.60
+UMBRAL_CORRECCION_POSE = 0.92
 UMBRAL_GIRO = 0.15          # cuanto hay que girar la cabeza a izquierda / derecha (unos 20 grados)
 UMBRAL_VERTICAL = 0.07      # cuanto hay que mover la cabeza arriba / abajo (unos 12 grados)
 NUM_MOVIMIENTOS = 2         # movimientos de la cabeza que se piden en el reconocimiento facial
@@ -269,32 +276,41 @@ def decidir_palabra(persona, perfiles, frase):
     return persona, f"Palabra secreta de {persona} correcta (diferencia {propia:.2f}).", False
 
 
-def decidir_identidad(resultados, perfiles, tipo, calcular_huella, umbral):
+def decidir_identidad(resultados, perfiles, tipo, calcular_huella, umbral, umbral_correccion=None):
     """Decide quien es la persona.
 
     resultados: lista de (nombre, probabilidad), uno por cada analisis (cara, foto completa...).
+    umbral_correccion: el modelo de Teachable Machine confunde a veces a las personas (por ejemplo dice
+    "burbano" para julian). Si el modelo ve a una persona pero dice otro nombre (o los analisis no
+    coinciden), se acepta el perfil registrado mas parecido cuando su parecido llega a este valor.
+    None = sin correccion: el modelo y el perfil deben decir la misma persona.
     Devuelve (dato, motivo): dato es el nombre de la persona, "otros" o "falso".
     """
     nombres = {nombre for nombre, _ in resultados}
     if "falso" in nombres:
         return "falso", "El modelo detecta una foto o una pantalla."
-    if len(nombres) > 1:
-        return "otros", "Los análisis no coinciden."
-    nombre = nombres.pop()
-    if nombre in NO_PERSONAS:
-        return "otros", f"Clase «{nombre}»."
+    clases = sorted(nombres & NO_PERSONAS)
+    if clases:
+        return "otros", f"Clase «{clases[0]}»."
     if min(p for _, p in resultados) < UMBRAL_CONFIANZA:
         return "otros", f"Confianza menor al {UMBRAL_CONFIANZA:.0%}."
+    if len(nombres) > 1 and umbral_correccion is None:
+        return "otros", "Los análisis no coinciden."
     huella = calcular_huella()
-    similitud = perfiles.similitud(nombre, tipo, huella)
-    if similitud is None:
-        return "otros", f"{nombre} no tiene perfil de {tipo} registrado (usa «Registrar {tipo}»)."
-    if similitud < umbral:
-        return "otros", f"No coincide con el perfil de {nombre} (parecido {similitud:.2f}, mínimo {umbral})."
     otro, parecido = perfiles.mas_parecido(tipo, huella)
-    if otro != nombre:
-        return "otros", f"Se parece más al perfil de {otro} ({parecido:.2f}) que al de {nombre} ({similitud:.2f})."
-    return nombre, f"Coincide con el perfil de {nombre} (parecido {similitud:.2f})."
+    if otro is None:
+        return "otros", f"Nadie tiene perfil de {tipo} registrado (usa «Registrar {tipo}»)."
+    if nombres == {otro}:  # el modelo y el perfil dicen la misma persona
+        if parecido < umbral:
+            return "otros", f"No coincide con el perfil de {otro} (parecido {parecido:.2f}, mínimo {umbral})."
+        return otro, f"Coincide con el perfil de {otro} (parecido {parecido:.2f})."
+    modelo = " / ".join(sorted(nombres))
+    if umbral_correccion is not None and parecido >= umbral_correccion:
+        return otro, (f"El modelo dice {modelo}, pero coincide claramente con el perfil de {otro} "
+                      f"(parecido {parecido:.2f}, mínimo {umbral_correccion}).")
+    if len(nombres) == 1 and perfiles.similitud(modelo, tipo, huella) is None:
+        return "otros", f"{modelo} no tiene perfil de {tipo} registrado (usa «Registrar {tipo}»)."
+    return "otros", f"El modelo dice {modelo}, pero se parece más al perfil de {otro} ({parecido:.2f})."
 
 
 # ---------------- Fases de un intento de acceso ----------------
